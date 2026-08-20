@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build and test output
+dist/
+build/
+coverage/
+*.crx
+*.zip
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+.cache/
+
+# Editor settings
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
