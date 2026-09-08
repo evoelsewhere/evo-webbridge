@@ -3784,9 +3784,14 @@ async function cmdDrag(params) {
     source_index = 0,
     target_index = 0,
     steps = 10,
+    drag_mode = "mouse",
+    drag_data = {},
   } = params || {};
   if (!source_selector || !target_selector) {
     throw new Error("drag requires source_selector and target_selector");
+  }
+  if (!new Set(["mouse", "native"]).has(drag_mode)) {
+    throw new Error('drag_mode must be "mouse" or "native"');
   }
   const sourceSel = JSON.stringify(source_selector);
   const targetSel = JSON.stringify(target_selector);
@@ -3812,6 +3817,38 @@ async function cmdDrag(params) {
     })()`
   );
   if (points?.error) throw new Error(points.error);
+
+  if (drag_mode === "native") {
+    const items = Object.entries(drag_data || {})
+      .filter(([mimeType, data]) => typeof mimeType === "string" && typeof data === "string")
+      .map(([mimeType, data]) => ({ mimeType, data }));
+    if (!items.length) {
+      items.push({ mimeType: "text/plain", data: "" });
+    }
+    const dragData = {
+      items,
+      dragOperationsMask: 1,
+    };
+    const dragPath = humanPointerPath(points.from, points.to, Math.max(2, Math.min(50, Number(steps) || 10)));
+    await cdpSend(tab.id, "Input.dispatchDragEvent", {
+      type: "dragEnter", x: points.from.x, y: points.from.y, data: dragData,
+    });
+    for (const point of dragPath) {
+      await cdpSend(tab.id, "Input.dispatchDragEvent", {
+        type: "dragOver", x: point.x, y: point.y, data: dragData,
+      });
+      if (point.delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, Math.max(8, point.delayMs)));
+      }
+    }
+    await cdpSend(tab.id, "Input.dispatchDragEvent", {
+      type: "drop", x: points.to.x, y: points.to.y, data: dragData,
+    });
+    return {
+      success: true, drag_mode, source_selector, target_selector,
+      from: points.from, to: points.to, data_types: items.map(({ mimeType }) => mimeType),
+    };
+  }
 
   const moveSteps = Math.max(2, Math.min(50, Number(steps) || 10));
   let current = points.from;
