@@ -26,6 +26,8 @@ const PENDING_INTERACTION_TTL_MS = 5 * 60 * 1000;
 const RECONNECT_BASE_MS = 1000; // first retry delay
 const RECONNECT_MAX_MS = 30000; // cap on the exponential backoff
 const CONNECT_TIMEOUT_MS = 15000;
+const DEFAULT_COMMAND_TIMEOUT_MS = 60000;
+const MAX_COMMAND_TIMEOUT_MS = 120000;
 const HEARTBEAT_ALARM = "webbridge-heartbeat";
 const HEARTBEAT_PERIOD_MIN = 0.5; // minimum period chrome.alarms allows
 const TEXT_WATCH_ALARM = "webbridge-text-watch";
@@ -1650,6 +1652,12 @@ function generateId() {
   return "ext-" + Math.random().toString(36).substring(2, 10);
 }
 
+function commandTimeoutMs(params) {
+  const value = Number(params?.timeout_ms);
+  if (!Number.isFinite(value)) return DEFAULT_COMMAND_TIMEOUT_MS;
+  return Math.max(100, Math.min(MAX_COMMAND_TIMEOUT_MS, value));
+}
+
 // ── Message handling ─────────────────────────────────────────────────────────
 
 async function handleMessage(msg) {
@@ -1674,9 +1682,10 @@ async function handleCommand(msg) {
   const { request_id, action, params } = msg;
 
   try {
-    let result;
+    const command = (async () => {
+      let result;
 
-    switch (action) {
+      switch (action) {
       case "navigate":
         result = await cmdNavigate(params);
         break;
@@ -1800,12 +1809,25 @@ async function handleCommand(msg) {
       case "status":
         result = await cmdStatus();
         break;
-      default:
-        sendResponse(request_id, false, null, `Unknown action: ${action}`);
-        return;
-    }
+        default:
+          throw new Error(`Unknown action: ${action}`);
+      }
 
-    sendResponse(request_id, true, result);
+      return result;
+    })();
+    const timeoutMs = commandTimeoutMs(params);
+    let timeoutId;
+    const timeout = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        reject(new Error(`Command '${action}' timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
+    try {
+      const result = await Promise.race([command, timeout]);
+      sendResponse(request_id, true, result);
+    } finally {
+      clearTimeout(timeoutId);
+    }
   } catch (e) {
     // Not a crash — the failure is reported back to the agent via
     // sendResponse(false). Keep it as a warning so chrome://extensions
@@ -2930,7 +2952,7 @@ async function cmdNavigate(params) {
     timeoutId = setTimeout(() => {
       chrome.tabs.onUpdated.removeListener(listener);
       resolve(false);
-    }, 30000);
+    }, commandTimeoutMs(params));
   });
 
   try {
@@ -3479,7 +3501,8 @@ async function cmdWait(params) {
 
 async function cmdWaitForLoad(params) {
   const tab = await resolveTab(params);
-  const { state = "load", timeout_ms = 30000 } = params || {};
+  const { state = "load" } = params || {};
+  const timeout_ms = commandTimeoutMs(params);
   const target = state === "domcontentloaded" ? ["interactive", "complete"] : ["complete"];
   const deadline = Date.now() + timeout_ms;
   while (Date.now() < deadline) {
