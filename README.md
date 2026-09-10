@@ -15,9 +15,12 @@ Chrome DevTools Protocol (`chrome.debugger`):
 - **Navigation/tabs** — navigate, back, forward, reload, get_tabs, switch_tab,
   open_tab, close_tab.
 - **Element-based (preferred)** — snapshot, click_selector, click_text, hover,
-  focus, fill, select_option, set_checked, and drag. `drag` uses real CDP mouse
-  actions by default; pass `drag_mode: "native"` with a `drag_data` object such
-  as `{ "text/plain": "item-id" }` for HTML5 `dragEnter`/`dragOver`/`drop`.
+  focus, fill, select_option, set_checked, drag, and drag_to_point. `drag` uses
+  real CDP mouse actions by default, including the press delay and movement
+  threshold expected by common React drag-and-drop libraries. Use
+  `drag_to_point` when the target is easier to identify by viewport coordinates.
+  Pass `drag_mode: "native"` with a `drag_data` object such as
+  `{ "text/plain": "item-id" }` for HTML5 `dragEnter`/`dragOver`/`drop`.
   Snapshots include inferred
   roles, accessible names, selectors, boxes, control states, useful attributes,
   and page/viewport metadata.

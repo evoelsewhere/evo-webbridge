@@ -84,7 +84,7 @@ const COMMAND_CAPABILITIES = [
   "extract", "get_tabs", "switch_tab", "evaluate", "back", "forward",
   "reload", "wait", "wait_for_selector", "wait_for_text", "wait_for_load",
   "wait_for_network_idle", "wait_for_url", "click_selector", "click_text", "hover", "focus",
-  "select_option", "set_checked", "drag", "fill", "open_tab", "close_tab",
+  "select_option", "set_checked", "drag", "drag_to_point", "fill", "open_tab", "close_tab",
   "snapshot", "semantic_snapshot", "semantic_read", "semantic_select",
   "semantic_write", "extract_elements", "scroll_to_bottom", "resize",
   "reset_viewport", "dialogs", "handle_dialog", "status",
@@ -1783,6 +1783,9 @@ async function handleCommand(msg) {
         break;
       case "drag":
         result = await cmdDrag(params);
+        break;
+      case "drag_to_point":
+        result = await cmdDragToPoint(params);
         break;
       case "fill":
         result = await cmdFill(params);
@@ -3948,19 +3951,30 @@ async function cmdDrag(params) {
     };
   }
 
-  const moveSteps = Math.max(2, Math.min(50, Number(steps) || 10));
-  let current = points.from;
-  await cdpSend(tab.id, "Input.dispatchMouseEvent", {
+  await performMouseDrag(tab.id, points.from, points.to, steps);
+  return { success: true, source_selector, target_selector, from: points.from, to: points.to };
+}
+
+async function performMouseDrag(tabId, from, to, steps = 30) {
+  const moveSteps = Math.max(3, Math.min(50, Number(steps) || 30));
+  const distance = Math.max(1, Math.hypot(to.x - from.x, to.y - from.y));
+  const nudge = {
+    x: from.x + ((to.x - from.x) / distance) * 8,
+    y: from.y + ((to.y - from.y) / distance) * 8,
+  };
+  let current = from;
+  await cdpSend(tabId, "Input.dispatchMouseEvent", {
     type: "mouseMoved", x: current.x, y: current.y,
   });
-  await cdpSend(tab.id, "Input.dispatchMouseEvent", {
+  await cdpSend(tabId, "Input.dispatchMouseEvent", {
     type: "mousePressed", x: current.x, y: current.y, button: "left", buttons: 1, clickCount: 1,
   });
   try {
-    const dragPath = humanPointerPath(points.from, points.to, moveSteps);
+    await new Promise((resolve) => setTimeout(resolve, 140));
+    const dragPath = [nudge, ...humanPointerPath(nudge, to, moveSteps)];
     for (let step = 0; step < dragPath.length; step++) {
       current = dragPath[step];
-      await cdpSend(tab.id, "Input.dispatchMouseEvent", {
+      await cdpSend(tabId, "Input.dispatchMouseEvent", {
         type: "mouseMoved", x: current.x, y: current.y, button: "left", buttons: 1,
       });
       if (step < dragPath.length - 1) {
@@ -3968,11 +3982,32 @@ async function cmdDrag(params) {
       }
     }
   } finally {
-    await cdpSend(tab.id, "Input.dispatchMouseEvent", {
+    await cdpSend(tabId, "Input.dispatchMouseEvent", {
       type: "mouseReleased", x: current.x, y: current.y, button: "left", buttons: 0, clickCount: 1,
     });
   }
-  return { success: true, source_selector, target_selector, from: points.from, to: points.to };
+}
+
+async function cmdDragToPoint(params) {
+  const tab = await resolveTab(params);
+  const { source_selector, source_index = 0, target_x, target_y, steps = 30 } = params || {};
+  if (!source_selector) throw new Error("drag_to_point requires source_selector");
+  if (!Number.isFinite(Number(target_x)) || !Number.isFinite(Number(target_y))) {
+    throw new Error("drag_to_point requires numeric target_x and target_y");
+  }
+  const sourceSel = JSON.stringify(source_selector);
+  const source = await elementCenter(
+    tab.id,
+    `document.querySelectorAll(${sourceSel})[${Math.max(0, Number(source_index) || 0)}]`,
+  );
+  if (!source) throw new Error(`No visible element for selector ${source_selector} (index ${source_index})`);
+  const target = { x: Number(target_x), y: Number(target_y) };
+  const viewport = await getViewportMetrics(tab.id);
+  if (target.x < 0 || target.y < 0 || target.x > viewport.width || target.y > viewport.height) {
+    throw new Error("drag_to_point target must be inside the viewport");
+  }
+  await performMouseDrag(tab.id, source, target, steps);
+  return { success: true, source_selector, from: source, to: target };
 }
 
 async function cmdFill(params) {
