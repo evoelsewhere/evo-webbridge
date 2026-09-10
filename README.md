@@ -23,8 +23,10 @@ Chrome DevTools Protocol (`chrome.debugger`):
   and page/viewport metadata.
 - **Coordinate/low-level** — click (left/middle/right), dblclick, type, key,
   and scroll. `key` supports Alt/Control/Meta/Shift modifiers for shortcuts.
-- **Waiting** — wait, wait_for_selector, wait_for_text, wait_for_load, and
-  wait_for_network_idle.
+- **Waiting** — wait, wait_for_selector, wait_for_text, wait_for_load,
+  wait_for_url, and wait_for_network_idle. `wait_for_url` accepts an exact URL
+  or a `*` wildcard and is useful after links that update an SPA route without
+  a full page load.
 - **Responsive testing** — resize applies mobile/tablet/desktop or explicit
   viewport dimensions with DPR, touch, and color-scheme emulation;
   reset_viewport restores the real browser size.

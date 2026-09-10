@@ -83,7 +83,7 @@ const COMMAND_CAPABILITIES = [
   "navigate", "click", "dblclick", "type", "key", "scroll", "screenshot",
   "extract", "get_tabs", "switch_tab", "evaluate", "back", "forward",
   "reload", "wait", "wait_for_selector", "wait_for_text", "wait_for_load",
-  "wait_for_network_idle", "click_selector", "click_text", "hover", "focus",
+  "wait_for_network_idle", "wait_for_url", "click_selector", "click_text", "hover", "focus",
   "select_option", "set_checked", "drag", "fill", "open_tab", "close_tab",
   "snapshot", "semantic_snapshot", "semantic_read", "semantic_select",
   "semantic_write", "extract_elements", "scroll_to_bottom", "resize",
@@ -1658,6 +1658,11 @@ function commandTimeoutMs(params) {
   return Math.max(100, Math.min(MAX_COMMAND_TIMEOUT_MS, value));
 }
 
+function urlMatchesPattern(url, pattern) {
+  const escaped = String(pattern).replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^${escaped.replace(/\*/g, ".*")}$`).test(String(url || ""));
+}
+
 // ── Message handling ─────────────────────────────────────────────────────────
 
 async function handleMessage(msg) {
@@ -1754,6 +1759,9 @@ async function handleCommand(msg) {
         break;
       case "wait_for_network_idle":
         result = await cmdWaitForNetworkIdle(params);
+        break;
+      case "wait_for_url":
+        result = await cmdWaitForUrl(params);
         break;
       case "click_selector":
         result = await cmdClickSelector(params);
@@ -2963,6 +2971,12 @@ async function cmdNavigate(params) {
     throw e;
   }
   const loaded = await completed;
+  const route = await cmdWaitForUrl({
+    ...params,
+    url: params.url,
+    timeout_ms: commandTimeoutMs(params),
+  });
+  await waitForDomSettled(tab.id);
   await broadcastTabInfo();
   const current = await chrome.tabs.get(tab.id);
   if (browserOrigin(current.url || current.pendingUrl || "")) {
@@ -2970,7 +2984,7 @@ async function cmdNavigate(params) {
   }
   return {
     success: true,
-    url: current.url || current.pendingUrl || params.url,
+    url: route.url || current.url || current.pendingUrl || params.url,
     timed_out: !loaded,
   };
 }
@@ -3536,6 +3550,67 @@ async function cmdWaitForNetworkIdle(params) {
     await sleep(100);
   }
   return { success: true, idle: false, inflight: netCount(tab.id), timed_out: true };
+}
+
+async function cmdWaitForUrl(params) {
+  const tab = await resolveTab(params);
+  const pattern = params?.url || params?.pattern;
+  if (!pattern) throw new Error("wait_for_url requires url or pattern");
+  const timeoutMs = commandTimeoutMs(params);
+  const deadline = Date.now() + timeoutMs;
+  let currentUrl = "";
+
+  while (Date.now() < deadline) {
+    const current = await chrome.tabs.get(tab.id);
+    currentUrl = current.url || current.pendingUrl || "";
+    if (urlMatchesPattern(currentUrl, pattern)) {
+      return { success: true, url: currentUrl, pattern };
+    }
+    if (browserOrigin(currentUrl)) {
+      try {
+        const pageUrl = await evalInPage(tab.id, "location.href");
+        if (urlMatchesPattern(pageUrl, pattern)) {
+          return { success: true, url: pageUrl, pattern };
+        }
+      } catch {
+        // The document may be between unload and the SPA route render.
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Timed out after ${timeoutMs}ms waiting for URL ${JSON.stringify(pattern)} (last: ${currentUrl || "unknown"})`);
+}
+
+async function waitForDomSettled(tabId, quietMs = 350, timeoutMs = 2000) {
+  try {
+    await evalInPage(
+      tabId,
+      `(async () => {
+        const quietMs = ${quietMs};
+        const timeoutMs = ${timeoutMs};
+        await new Promise((resolve) => {
+          let quietTimer = null;
+          const finish = () => {
+            observer.disconnect();
+            if (quietTimer) clearTimeout(quietTimer);
+            clearTimeout(timeoutTimer);
+            resolve();
+          };
+          const settle = () => {
+            if (quietTimer) clearTimeout(quietTimer);
+            quietTimer = setTimeout(finish, quietMs);
+          };
+          const observer = new MutationObserver(settle);
+          observer.observe(document.documentElement || document, { childList: true, subtree: true, characterData: true, attributes: true });
+          const timeoutTimer = setTimeout(finish, timeoutMs);
+          settle();
+        });
+      })()`,
+      true,
+    );
+  } catch {
+    // DOM settlement is best-effort; the route match remains authoritative.
+  }
 }
 
 async function cmdWaitForSelector(params) {
