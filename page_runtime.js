@@ -25,7 +25,7 @@
  */
 
 (() => {
-  const VERSION = 3;
+  const VERSION = 4;
   if (globalThis.__evoflux && globalThis.__evoflux.v === VERSION) return "ready";
 
   const INTERACTIVE = [
@@ -245,6 +245,54 @@
     }
   }
 
+  /**
+   * `querySelectorAll`, but able to cross the boundaries it cannot.
+   *
+   * Scraping a list rendered by web components returned nothing at all: the
+   * records were real, in the document, visible on screen, and behind a
+   * shadow root that CSS does not reach into.
+   */
+  function queryAll(root, selector, deep, limit) {
+    const max = Math.max(1, Number(limit) || 1000);
+    const out = [];
+    const visit = (node, depth) => {
+      if (out.length >= max || depth > 12) return;
+      try {
+        for (const el of node.querySelectorAll(selector)) {
+          out.push(el);
+          if (out.length >= max) return;
+        }
+      } catch {
+        return;  // an invalid selector, or a node that refuses the query
+      }
+      if (!deep) return;
+      let all;
+      try {
+        all = node.querySelectorAll("*");
+      } catch {
+        return;
+      }
+      for (const el of all) {
+        if (out.length >= max) return;
+        if (el.shadowRoot) visit(el.shadowRoot, depth + 1);
+        if (el.tagName === "IFRAME") {
+          try {
+            if (el.contentDocument) visit(el.contentDocument, depth + 1);
+          } catch {
+            // Cross-origin: not ours to read.
+          }
+        }
+      }
+    };
+    visit(root || document, 0);
+    return out;
+  }
+
+  /** The first match, searched the same way. */
+  function query(root, selector, deep) {
+    return queryAll(root, selector, deep, 1)[0] || null;
+  }
+
   // ── Snapshots and what changed between them ────────────────────────────
   function fingerprint(item) {
     return [
@@ -419,6 +467,8 @@
     // them and not only the ones that dispatch input events.
     element: fromSpec,
     ref: refFor,
+    queryAll,
+    query,
     describe: (el) => describe(el, 0, 0),
   };
   return "ready";

@@ -3381,18 +3381,26 @@ async function cmdExtractElements(params) {
   const SEL = JSON.stringify(selector);
   const FIELDS = JSON.stringify(fields || null);
   const LIMIT = Math.max(1, Math.min(1000, Number(limit) || 100));
+  // A list rendered by web components is behind a shadow root, where CSS
+  // finds nothing; `deep` searches through those boundaries, and `ref`
+  // starts the search inside one.
+  const deep = params?.deep !== false;
+  await ensureRuntime(tab.id);
+  const ROOT = params?.ref ? elementExpr({ ref: String(params.ref) }) : "document";
 
   const records = await evalInPage(
     tab.id,
     `(() => {
-      const els = [...document.querySelectorAll(${SEL})].slice(0, ${LIMIT});
+      const root = ${ROOT} || document;
+      const deep = ${deep ? "true" : "false"};
+      const els = __evoflux.queryAll(root, ${SEL}, deep, ${LIMIT});
       const fields = ${FIELDS};
       const txt = (el) => (el.innerText || el.textContent || "").replace(/\\s+/g, " ").trim();
       const pull = (rootEl, spec) => {
         let sel = spec, attr = null;
         const at = spec.lastIndexOf("@");
         if (at > 0) { sel = spec.slice(0, at); attr = spec.slice(at + 1); }
-        const t = sel ? rootEl.querySelector(sel) : rootEl;
+        const t = sel ? __evoflux.query(rootEl, sel, deep) : rootEl;
         if (!t) return null;
         if (attr) return ((attr === "href" || attr === "src") && t[attr]) ? t[attr] : t.getAttribute(attr);
         return txt(t);
@@ -3403,7 +3411,7 @@ async function cmdExtractElements(params) {
           for (const k in fields) rec[k] = pull(el, fields[k]);
           return rec;
         }
-        const a = el.matches("a[href]") ? el : el.querySelector("a[href]");
+        const a = el.matches("a[href]") ? el : __evoflux.query(el, "a[href]", deep);
         return { text: txt(el).slice(0, 300), href: a ? a.href : null };
       });
     })()`
@@ -3415,24 +3423,32 @@ async function cmdScrollToBottom(params) {
   const tab = await resolveTab(params);
   const max = Math.max(1, Math.min(100, Number(params?.max_scrolls) || 10));
   const delay = Math.max(50, Math.min(5000, Number(params?.delay_ms) || 600));
+  // Plenty of infinite lists scroll inside a pane rather than the window —
+  // a chat log, a data grid, a drawer. Scrolling the window then does
+  // nothing at all, twice, and reports that it reached the bottom.
+  const spec = targetSpec(params);
+  if (spec) await ensureRuntime(tab.id);
+  const SCROLLER = spec ? elementExpr(spec) : "null";
   const result = await evalInPage(
     tab.id,
     `(async () => {
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const pane = ${SCROLLER};
       const doc = document.documentElement;
+      const height = () => (pane ? pane.scrollHeight : doc.scrollHeight);
+      const toBottom = () => pane
+        ? pane.scrollTo(0, pane.scrollHeight)
+        : window.scrollTo(0, doc.scrollHeight);
       let scrolls = 0;
       for (let i = 0; i < ${max}; i++) {
-        const h = doc.scrollHeight;
-        window.scrollTo(0, h);
+        const h = height();
+        toBottom();
         scrolls++;
         await sleep(${delay});
-        if (doc.scrollHeight <= h) break; // no new content loaded → at bottom
+        if (height() <= h) break; // no new content loaded → at bottom
       }
-      return {
-        scrolls,
-        final_height: doc.scrollHeight,
-        at_bottom: window.innerHeight + window.scrollY >= doc.scrollHeight - 4,
-      };
+      const seen = pane ? pane.clientHeight + pane.scrollTop : innerHeight + scrollY;
+      return { scrolls, final_height: height(), at_bottom: seen >= height() - 4 };
     })()`,
     true
   );
@@ -3757,7 +3773,7 @@ async function cmdWaitForText(params) {
 // injected on demand and re-injected after a navigation wipes it, so no
 // command has to care whether it is there.
 
-const PAGE_RUNTIME_VERSION = 3;
+const PAGE_RUNTIME_VERSION = 4;
 let pageRuntimeSource = null;
 
 async function loadPageRuntime() {
