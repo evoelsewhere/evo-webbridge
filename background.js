@@ -1220,6 +1220,10 @@ async function sendContextMenuInteraction(info, tab) {
       created_at: Date.now(),
     },
   });
+  chrome.runtime.sendMessage({
+    type: "context_menu_draft_ready",
+    tab_id: tab.id,
+  }).catch(() => {});
   if (chrome.sidePanel?.open) {
     await chrome.sidePanel.open({ tabId: tab.id });
   }
