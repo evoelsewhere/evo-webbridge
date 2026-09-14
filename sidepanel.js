@@ -195,6 +195,7 @@ const toolActivities = new Map();
 const PANEL_REQUEST_STORAGE_KEY = "webbridgePanelPendingRequest";
 const PANEL_CONTEXT_DRAFT_STORAGE_KEY = "webbridgePanelContextDraft";
 const TAB_PAGE_INSTANCE_STORAGE_KEY = "webbridgeTabPageInstance";
+let contextMenuDraftConsumption = null;
 let themePreference = "system";
 let desktopAppearanceSynced = false;
 let desktopAppearanceRevision = -1;
@@ -683,9 +684,15 @@ function renderPanelContexts() {
   const currentContexts = panelContexts.filter((context) => context.tab_id === activeTab?.id);
   const items = [
     ...currentContexts.map((context) => ({
-      key: context.type,
-      label: context.type === "selection" ? "Selection" : "Page",
-      detail: context.text,
+      key: context.type === "floating_action_menu" ? `floating_action:${context.action}` : context.type,
+      label: context.type === "selection"
+        ? "Selection"
+        : context.type === "floating_action_menu"
+          ? String(context.action || "Action").replace(/[_-]+/g, " ").replace(/\b\w/g, (char) => char.toUpperCase())
+          : "Page",
+      detail: context.type === "floating_action_menu"
+        ? context.title || context.page_url || context.text
+        : context.text,
     })),
     ...(regionCapture?.tab_id === activeTab?.id ? [{
       key: "screenshot",
@@ -726,6 +733,9 @@ async function removePanelContext(type) {
   } else if (type.startsWith("file:")) {
     panelFiles.splice(Number(type.split(":")[1]), 1);
     if (!panelFiles.length) panelFileTabId = null;
+  } else if (type.startsWith("floating_action:")) {
+    const action = type.slice("floating_action:".length);
+    panelContexts = panelContexts.filter((context) => !(context.tab_id === activeTab?.id && context.type === "floating_action_menu" && context.action === action));
   } else {
     panelContexts = panelContexts.filter((context) => !(context.tab_id === activeTab?.id && context.type === type));
   }
@@ -1865,48 +1875,56 @@ async function loadPendingQuestions() {
 }
 
 async function consumeContextMenuDraft() {
-  if (!activeTab?.id) return;
-  const storage = panelSessionStorage();
-  const draftKey = `${PANEL_CONTEXT_DRAFT_STORAGE_KEY}:${activeTab.id}`;
-  const pageInstanceKey = `${TAB_PAGE_INSTANCE_STORAGE_KEY}:${activeTab.id}`;
-  const stored = await storage.get([draftKey, pageInstanceKey]);
-  const draft = stored[draftKey];
-  const currentPageUrl = safePageUrl(activeTab.url || activeTab.pendingUrl || "");
-  if (
-    !draft ||
-    !draft.created_at ||
-    Date.now() - draft.created_at > 5 * 60 * 1000 ||
-    draft.page_url !== currentPageUrl ||
-    !draft.page_instance_id ||
-    draft.page_instance_id !== stored[pageInstanceKey]
-  ) {
-    if (draft) await storage.remove([draftKey]);
-    return;
-  }
-  const payload = draft.payload || {};
-  const metadata = payload.metadata || {};
-  composer.value = payload.prompt || composer.value;
-  resizeComposer();
-  if (payload.context_type === "selection" && metadata.selection_text) {
-    panelContexts = panelContexts.filter((context) => !(context.tab_id === activeTab.id && context.type === "selection"));
-    panelContexts.push({
-      tab_id: activeTab.id,
-      type: "selection",
-      page_url: metadata.page_url,
-      title: metadata.page_title || "",
-      text: metadata.selection_text,
-    });
-  } else {
-    const detail = payload.context_type === "link" ? metadata.link_url : metadata.page_url;
-    if (detail) {
-      composer.value = `${composer.value}\n\nSource: ${detail}`.trim();
-      resizeComposer();
+  if (contextMenuDraftConsumption) return contextMenuDraftConsumption;
+  contextMenuDraftConsumption = (async () => {
+    if (!activeTab?.id) return;
+    const storage = panelSessionStorage();
+    const draftKey = `${PANEL_CONTEXT_DRAFT_STORAGE_KEY}:${activeTab.id}`;
+    const pageInstanceKey = `${TAB_PAGE_INSTANCE_STORAGE_KEY}:${activeTab.id}`;
+    const stored = await storage.get([draftKey, pageInstanceKey]);
+    const draft = stored[draftKey];
+    const currentPageUrl = safePageUrl(activeTab.url || activeTab.pendingUrl || "");
+    if (
+      !draft ||
+      !draft.created_at ||
+      Date.now() - draft.created_at > 5 * 60 * 1000 ||
+      draft.page_url !== currentPageUrl ||
+      !draft.page_instance_id ||
+      draft.page_instance_id !== stored[pageInstanceKey]
+    ) {
+      if (draft) await storage.remove([draftKey]);
+      return;
     }
+    const payload = draft.payload || {};
+    const metadata = payload.metadata || {};
+    composer.value = payload.prompt || composer.value;
+    resizeComposer();
+    if (payload.context_type === "selection" && metadata.selection_text) {
+      panelContexts = panelContexts.filter((context) => !(context.tab_id === activeTab.id && context.type === "selection"));
+      panelContexts.push({
+        tab_id: activeTab.id,
+        type: "selection",
+        page_url: metadata.page_url,
+        title: metadata.page_title || "",
+        text: metadata.selection_text,
+      });
+    } else {
+      const detail = payload.context_type === "link" ? metadata.link_url : metadata.page_url;
+      if (detail) {
+        composer.value = `${composer.value}\n\nSource: ${detail}`.trim();
+        resizeComposer();
+      }
+    }
+    await storage.remove([draftKey]);
+    renderPanelContexts();
+    setComposerStatus("Browser context ready · review and send.");
+    composer.focus();
+  })();
+  try {
+    await contextMenuDraftConsumption;
+  } finally {
+    contextMenuDraftConsumption = null;
   }
-  await storage.remove([draftKey]);
-  renderPanelContexts();
-  setComposerStatus("Browser context ready · review and send.");
-  composer.focus();
 }
 
 async function submitQuestion(request, inputs, button) {
@@ -3723,6 +3741,11 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 });
 chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type === "context_menu_draft_ready") {
+    if (message.tab_id !== activeTab?.id) return;
+    void consumeContextMenuDraft();
+    return;
+  }
   if (message?.type === "browser_dialog_opened") {
     if (message.dialog?.tab_id !== activeTab?.id) return;
     pendingBrowserDialog = message.dialog;
@@ -3767,6 +3790,22 @@ chrome.runtime.onMessage.addListener((message) => {
     elementPickerActive = Boolean(message.active);
     renderPickedElement();
     if (!elementPickerActive && !pickedElement) setComposerStatus("");
+    return;
+  }
+  if (message?.type === "floating_action_menu_result") {
+    if (message.tab_id !== activeTab?.id) return;
+    const actionName = String(message.action || "").replace(/[_-]+/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
+    panelContexts = panelContexts.filter((context) => !(context.tab_id === message.tab_id && context.type === "floating_action_menu" && context.action === message.action));
+    panelContexts.push({
+      tab_id: message.tab_id,
+      type: "floating_action_menu",
+      action: message.action,
+      page_url: message.page_url || "",
+      title: message.title || "",
+      text: `${actionName} from ${message.page_url || "this page"}`,
+    });
+    renderPanelContexts();
+    setComposerStatus(`${actionName} action attached.`);
     return;
   }
   if (message?.type === "region_capture_ready") {
