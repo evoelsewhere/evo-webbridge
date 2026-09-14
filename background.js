@@ -87,8 +87,12 @@ const COMMAND_CAPABILITIES = [
   "select_option", "set_checked", "drag", "drag_to_point", "fill", "open_tab", "close_tab",
   "snapshot", "semantic_snapshot", "semantic_read", "semantic_select",
   "semantic_write", "extract_elements", "scroll_to_bottom", "resize",
-  "reset_viewport", "dialogs", "handle_dialog", "status",
+  "reset_viewport", "dialogs", "handle_dialog", "status", "batch",
 ];
+
+// Bumped when the agent-facing behaviour of the commands changes, so the
+// caller can tell a browser that speaks refs from one that does not.
+const COMMAND_FEATURES = ["refs", "shadow_dom", "same_origin_frames", "batch", "diff_snapshot"];
 
 // ── Config (persisted in chrome.storage.local, edited in Side Chat settings) ─
 
@@ -1443,6 +1447,7 @@ async function connect() {
       version: chrome.runtime.getManifest().version,
       capabilities: {
         commands: COMMAND_CAPABILITIES,
+        features: COMMAND_FEATURES,
         interactions: ["context.share", "prompt.submit"],
         captures: ["selection", "link", "page_metadata"],
         ui: ["side_panel"],
@@ -1683,10 +1688,71 @@ async function handleMessage(msg) {
   }
 }
 
+/**
+ * Run several commands for one message.
+ *
+ * Every action used to be its own request across the relay: for a five-step
+ * form that is five round trips of network and worker wake-up to do work the
+ * page finishes in milliseconds. A batch pays that once. It stops at the
+ * first failure by default, because the steps of a form are a chain — there
+ * is nothing to gain from filling a field on a dialog that never opened.
+ */
+async function cmdBatch(params) {
+  const commands = Array.isArray(params?.commands) ? params.commands : [];
+  if (!commands.length) throw new Error("batch requires commands");
+  if (commands.length > 25) throw new Error("batch takes at most 25 commands");
+  const stopOnError = params?.stop_on_error !== false;
+  const results = [];
+  for (const [index, command] of commands.entries()) {
+    const name = command && command.action;
+    if (name === "batch") throw new Error("batch cannot contain a batch");
+    try {
+      const data = await runCommand(name, { ...(command.params || {}) });
+      results.push({ action: name, success: true, data });
+    } catch (error) {
+      results.push({ action: name, success: false, error: error.message });
+      if (stopOnError) {
+        return {
+          success: true,
+          results,
+          stopped_at: index,
+          skipped: commands.length - index - 1,
+        };
+      }
+    }
+  }
+  return { success: true, results, skipped: 0 };
+}
+
 async function handleCommand(msg) {
   const { request_id, action, params } = msg;
 
   try {
+    const command = runCommand(action, params);
+    const timeoutMs = commandTimeoutMs(params);
+    let timeoutId;
+    const timeout = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        reject(new Error(`Command '${action}' timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
+    try {
+      const result = await Promise.race([command, timeout]);
+      sendResponse(request_id, true, result);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  } catch (e) {
+    // Not a crash — the failure is reported back to the agent via
+    // sendResponse(false). Keep it as a warning so chrome://extensions
+    // "Errors" stays reserved for real extension faults.
+    console.warn(`[WebBridge] Command failed (${action}):`, e.message);
+    sendResponse(request_id, false, null, e.message);
+  }
+}
+
+async function runCommand(action, params) {
+  {
     const command = (async () => {
       let result;
 
@@ -1820,31 +1886,16 @@ async function handleCommand(msg) {
       case "status":
         result = await cmdStatus();
         break;
+      case "batch":
+        result = await cmdBatch(params);
+        break;
         default:
           throw new Error(`Unknown action: ${action}`);
       }
 
       return result;
     })();
-    const timeoutMs = commandTimeoutMs(params);
-    let timeoutId;
-    const timeout = new Promise((_, reject) => {
-      timeoutId = setTimeout(() => {
-        reject(new Error(`Command '${action}' timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-    });
-    try {
-      const result = await Promise.race([command, timeout]);
-      sendResponse(request_id, true, result);
-    } finally {
-      clearTimeout(timeoutId);
-    }
-  } catch (e) {
-    // Not a crash — the failure is reported back to the agent via
-    // sendResponse(false). Keep it as a warning so chrome://extensions
-    // "Errors" stays reserved for real extension faults.
-    console.warn(`[WebBridge] Command failed (${action}):`, e.message);
-    sendResponse(request_id, false, null, e.message);
+    return command;
   }
 }
 
@@ -3691,30 +3742,119 @@ async function cmdWaitForText(params) {
 
 // Scroll the matched element into view and return its viewport-relative CSS
 // centre (matching the clip=scale-1 screenshot coordinate space).
-async function elementCenter(tabId, expr) {
-  const rect = await evalInPage(
+// ── Page runtime ─────────────────────────────────────────────────────────────
+// The half of WebBridge that lives in the page: element handles, the walk
+// through shadow roots and frames, hit-testing, and the change counter. It is
+// injected on demand and re-injected after a navigation wipes it, so no
+// command has to care whether it is there.
+
+const PAGE_RUNTIME_VERSION = 3;
+let pageRuntimeSource = null;
+
+async function loadPageRuntime() {
+  if (pageRuntimeSource == null) {
+    const response = await fetch(chrome.runtime.getURL("page_runtime.js"));
+    pageRuntimeSource = await response.text();
+  }
+  return pageRuntimeSource;
+}
+
+async function ensureRuntime(tabId) {
+  // Cheap enough to ask every time, and asking is the only way to notice a
+  // navigation replaced the document under us.
+  const present = await evalInPage(
     tabId,
-    `(() => {
-      const el = ${expr};
-      if (!el) return null;
-      el.scrollIntoView({ block: "center", inline: "center" });
-      const r = el.getBoundingClientRect();
-      if (r.width === 0 && r.height === 0) return null;
-      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
-    })()`
+    `(globalThis.__evoflux && __evoflux.v) || 0`,
   );
-  return rect;
+  if (present === PAGE_RUNTIME_VERSION) return;
+  await evalInPage(tabId, await loadPageRuntime());
+}
+
+/** What the caller named: a handle from a snapshot, or a CSS selector. */
+function targetSpec(params, selectorKey = "selector", indexKey = "index") {
+  if (params && params.ref) return { ref: String(params.ref) };
+  const selector = params && params[selectorKey];
+  if (!selector) return null;
+  return {
+    selector: String(selector),
+    index: Math.max(0, Number(params && params[indexKey]) || 0),
+  };
+}
+
+function describeSpec(spec) {
+  return spec.ref ? `ref ${spec.ref}` : `selector ${spec.selector}`;
+}
+
+/**
+ * Scroll a target into view, check something else is not sitting on top of
+ * it, and return the point to hit it at.
+ *
+ * The check is the point: a press dispatched at a covered element reports
+ * success and does nothing, which is indistinguishable from a page that
+ * ignored the click — so the agent retries, re-snapshots, and retries again.
+ */
+async function prepareTarget(tabId, spec) {
+  await ensureRuntime(tabId);
+  const prepared = await evalInPage(
+    tabId,
+    `__evoflux.prepare(${JSON.stringify(spec)})`,
+  );
+  if (!prepared) throw new Error(`No element for ${describeSpec(spec)}`);
+  if (!prepared.ok) throw new Error(prepared.reason || `Cannot act on ${describeSpec(spec)}`);
+  return prepared;
+}
+
+/** An expression that resolves *spec* inside the page, shadow roots included. */
+function elementExpr(spec) {
+  return `__evoflux.element(${JSON.stringify(spec)})`;
+}
+
+async function markPage(tabId) {
+  try {
+    await ensureRuntime(tabId);
+    return await evalInPage(tabId, `__evoflux.mark()`);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What the action changed, so the caller does not have to spend a snapshot
+ * finding out whether anything happened at all.
+ */
+async function settle(tabId, mark, waitMs = 120) {
+  if (!mark) return {};
+  await new Promise((resolve) => setTimeout(resolve, waitMs));
+  try {
+    const after = await evalInPage(tabId, `__evoflux.since(${JSON.stringify(mark)})`);
+    if (!after) return {};
+    const changed = {};
+    if (after.navigated) changed.navigated_to = after.url;
+    if (after.mutations) changed.dom_changes = after.mutations;
+    if (!after.navigated && !after.mutations) changed.dom_changes = 0;
+    return changed;
+  } catch {
+    // A navigation can tear the context down mid-question; the action still
+    // happened, and the caller can look for itself.
+    return {};
+  }
 }
 
 async function cmdClickSelector(params) {
   const tab = await resolveTab(params);
-  const { selector, index = 0 } = params || {};
-  if (!selector) throw new Error("click_selector requires a selector");
-  const sel = JSON.stringify(selector);
-  const center = await elementCenter(tab.id, `document.querySelectorAll(${sel})[${Number(index) || 0}]`);
-  if (!center) throw new Error(`No visible element for selector ${selector} (index ${index})`);
-  await clickAt(tab.id, center.x, center.y);
-  return { success: true, selector, x: center.x, y: center.y };
+  const spec = targetSpec(params);
+  if (!spec) throw new Error("click_selector requires a selector or a ref");
+  const target = await prepareTarget(tab.id, spec);
+  const mark = await markPage(tab.id);
+  await clickAt(tab.id, target.x, target.y);
+  return {
+    success: true,
+    ref: target.ref,
+    target: target.name || spec.selector || spec.ref,
+    x: target.x,
+    y: target.y,
+    ...(await settle(tab.id, mark)),
+  };
 }
 
 async function cmdClickText(params) {
@@ -3740,62 +3880,84 @@ async function cmdClickText(params) {
     }
     return best;
   })()`;
-  const center = await elementCenter(tab.id, finder);
-  if (!center) throw new Error(`No visible element with text ${JSON.stringify(text)}`);
-  await clickAt(tab.id, center.x, center.y);
-  return { success: true, text, x: center.x, y: center.y };
+  // Hand the match back as a handle so the click goes through the same
+  // scroll-and-hit-test every other targeted action does.
+  await ensureRuntime(tab.id);
+  const ref = await evalInPage(
+    tab.id,
+    `(() => { const el = ${finder}; return el ? __evoflux.ref(el) : null; })()`,
+  );
+  if (!ref) throw new Error(`No visible element with text ${JSON.stringify(text)}`);
+  const target = await prepareTarget(tab.id, { ref });
+  const mark = await markPage(tab.id);
+  await clickAt(tab.id, target.x, target.y);
+  return {
+    success: true,
+    text,
+    ref: target.ref,
+    x: target.x,
+    y: target.y,
+    ...(await settle(tab.id, mark)),
+  };
 }
 
 async function cmdHover(params) {
   const tab = await resolveTab(params);
-  const { selector, index = 0 } = params || {};
-  if (!selector) throw new Error("hover requires a selector");
-  const sel = JSON.stringify(selector);
-  const itemIndex = Math.max(0, Number(index) || 0);
-  const center = await elementCenter(tab.id, `document.querySelectorAll(${sel})[${itemIndex}]`);
-  if (!center) throw new Error(`No visible element for selector ${selector} (index ${index})`);
+  const spec = targetSpec(params);
+  if (!spec) throw new Error("hover requires a selector or a ref");
+  const target = await prepareTarget(tab.id, spec);
+  const mark = await markPage(tab.id);
   await cdpSend(tab.id, "Input.dispatchMouseEvent", {
     type: "mouseMoved",
-    x: center.x,
-    y: center.y,
+    x: target.x,
+    y: target.y,
   });
-  return { success: true, selector, x: center.x, y: center.y };
+  return {
+    success: true,
+    ref: target.ref,
+    target: target.name || spec.selector || spec.ref,
+    x: target.x,
+    y: target.y,
+    // A hover exists to reveal something, so what it revealed is the answer.
+    ...(await settle(tab.id, mark, 200)),
+  };
 }
 
 async function cmdFocus(params) {
   const tab = await resolveTab(params);
-  const { selector, index = 0 } = params || {};
-  if (!selector) throw new Error("focus requires a selector");
-  const sel = JSON.stringify(selector);
-  const itemIndex = Math.max(0, Number(index) || 0);
+  const spec = targetSpec(params);
+  if (!spec) throw new Error("focus requires a selector or a ref");
+  await ensureRuntime(tab.id);
   const focused = await evalInPage(
     tab.id,
     `(() => {
-      const el = document.querySelectorAll(${sel})[${itemIndex}];
+      const el = ${elementExpr(spec)};
       if (!el || typeof el.focus !== "function") return false;
       el.scrollIntoView({ block: "center", inline: "center" });
       el.focus();
-      return document.activeElement === el;
+      const root = el.getRootNode();
+      return (root.activeElement || document.activeElement) === el;
     })()`
   );
-  if (!focused) throw new Error(`Element ${selector} (index ${index}) could not be focused`);
-  return { success: true, selector, index: itemIndex };
+  if (!focused) throw new Error(`Element at ${describeSpec(spec)} could not be focused`);
+  return { success: true, ...spec };
 }
 
 async function cmdSelectOption(params) {
   const tab = await resolveTab(params);
-  const { selector, values, match = "value" } = params || {};
-  if (!selector) throw new Error("select_option requires a selector");
+  const { values, match = "value" } = params || {};
+  const spec = targetSpec(params);
+  if (!spec) throw new Error("select_option requires a selector or a ref");
   if (!Array.isArray(values) || values.length === 0) {
     throw new Error("select_option requires at least one value");
   }
-  const sel = JSON.stringify(selector);
   const requested = JSON.stringify(values.map(String));
   const matchBy = match === "label" ? "label" : "value";
+  await ensureRuntime(tab.id);
   const result = await evalInPage(
     tab.id,
     `(() => {
-      const el = document.querySelector(${sel});
+      const el = ${elementExpr(spec)};
       const requested = ${requested};
       const matchBy = ${JSON.stringify(matchBy)};
       if (!(el instanceof HTMLSelectElement)) return { error: "selector did not match a select element" };
@@ -3824,7 +3986,7 @@ async function cmdSelectOption(params) {
     })()`
   );
   if (result?.error) throw new Error(result.error);
-  return { success: true, selector, selected: result?.selected || [] };
+  return { success: true, ...spec, selected: result?.selected || [] };
 }
 
 async function checkedElementState(tabId, expression) {
@@ -3847,23 +4009,22 @@ async function checkedElementState(tabId, expression) {
 
 async function cmdSetChecked(params) {
   const tab = await resolveTab(params);
-  const { selector, checked, index = 0 } = params || {};
-  if (!selector) throw new Error("set_checked requires a selector");
+  const { checked } = params || {};
+  const spec = targetSpec(params);
+  if (!spec) throw new Error("set_checked requires a selector or a ref");
   if (typeof checked !== "boolean") throw new Error("set_checked requires a boolean checked value");
-  const sel = JSON.stringify(selector);
-  const itemIndex = Math.max(0, Number(index) || 0);
-  const expression = `document.querySelectorAll(${sel})[${itemIndex}]`;
+  await ensureRuntime(tab.id);
+  const expression = elementExpr(spec);
   const before = await checkedElementState(tab.id, expression);
-  if (!before?.exists) throw new Error(`No element for selector ${selector} (index ${index})`);
+  if (!before?.exists) throw new Error(`No element for ${describeSpec(spec)}`);
   if (!before.supported) throw new Error("Element is not a checkbox, radio, switch, or ARIA toggle");
   if (before.disabled) throw new Error("Element is disabled");
   if (before.checked === checked) {
-    return { success: true, selector, checked, changed: false };
+    return { success: true, ...spec, checked, changed: false };
   }
 
-  const center = await elementCenter(tab.id, expression);
-  if (!center) throw new Error(`Element ${selector} is not visible`);
-  await clickAt(tab.id, center.x, center.y);
+  const target = await prepareTarget(tab.id, spec);
+  await clickAt(tab.id, target.x, target.y);
 
   let after = null;
   for (let attempt = 0; attempt < 6; attempt++) {
@@ -3874,7 +4035,7 @@ async function cmdSetChecked(params) {
   if (after?.checked !== checked) {
     throw new Error(`Element remained checked=${after?.checked}; requested checked=${checked}`);
   }
-  return { success: true, selector, checked, changed: true };
+  return { success: true, ...spec, ref: target.ref, checked, changed: true };
 }
 
 async function cmdDrag(params) {
@@ -3882,27 +4043,28 @@ async function cmdDrag(params) {
   const {
     source_selector,
     target_selector,
-    source_index = 0,
-    target_index = 0,
     steps = 10,
     drag_mode = "mouse",
     drag_data = {},
   } = params || {};
-  if (!source_selector || !target_selector) {
-    throw new Error("drag requires source_selector and target_selector");
+  const sourceSpec = params?.source_ref
+    ? { ref: String(params.source_ref) }
+    : targetSpec(params, "source_selector", "source_index");
+  const targetSpecResolved = params?.target_ref
+    ? { ref: String(params.target_ref) }
+    : targetSpec(params, "target_selector", "target_index");
+  if (!sourceSpec || !targetSpecResolved) {
+    throw new Error("drag requires source and target (selector or ref for each)");
   }
   if (!new Set(["mouse", "native"]).has(drag_mode)) {
     throw new Error('drag_mode must be "mouse" or "native"');
   }
-  const sourceSel = JSON.stringify(source_selector);
-  const targetSel = JSON.stringify(target_selector);
-  const sourceIndex = Math.max(0, Number(source_index) || 0);
-  const targetIndex = Math.max(0, Number(target_index) || 0);
+  await ensureRuntime(tab.id);
   const points = await evalInPage(
     tab.id,
     `(() => {
-      const source = document.querySelectorAll(${sourceSel})[${sourceIndex}];
-      const target = document.querySelectorAll(${targetSel})[${targetIndex}];
+      const source = ${elementExpr(sourceSpec)};
+      const target = ${elementExpr(targetSpecResolved)};
       if (!source || !target) return { error: "source or target element not found" };
       source.scrollIntoView({ block: "center", inline: "center" });
       const point = (el) => {
@@ -3990,17 +4152,13 @@ async function performMouseDrag(tabId, from, to, steps = 30) {
 
 async function cmdDragToPoint(params) {
   const tab = await resolveTab(params);
-  const { source_selector, source_index = 0, target_x, target_y, steps = 30 } = params || {};
-  if (!source_selector) throw new Error("drag_to_point requires source_selector");
+  const { source_selector, target_x, target_y, steps = 30 } = params || {};
+  const spec = targetSpec(params, "source_selector", "source_index");
+  if (!spec) throw new Error("drag_to_point requires source_selector or ref");
   if (!Number.isFinite(Number(target_x)) || !Number.isFinite(Number(target_y))) {
     throw new Error("drag_to_point requires numeric target_x and target_y");
   }
-  const sourceSel = JSON.stringify(source_selector);
-  const source = await elementCenter(
-    tab.id,
-    `document.querySelectorAll(${sourceSel})[${Math.max(0, Number(source_index) || 0)}]`,
-  );
-  if (!source) throw new Error(`No visible element for selector ${source_selector} (index ${source_index})`);
+  const source = await prepareTarget(tab.id, spec);
   const target = { x: Number(target_x), y: Number(target_y) };
   const viewport = await getViewportMetrics(tab.id);
   if (target.x < 0 || target.y < 0 || target.x > viewport.width || target.y > viewport.height) {
@@ -4012,17 +4170,19 @@ async function cmdDragToPoint(params) {
 
 async function cmdFill(params) {
   const tab = await resolveTab(params);
-  const { selector, value = "", clear = true, submit = false } = params || {};
-  if (!selector) throw new Error("fill requires a selector");
-  const sel = JSON.stringify(selector);
+  const { value = "", clear = true, submit = false } = params || {};
+  const spec = targetSpec(params);
+  if (!spec) throw new Error("fill requires a selector or a ref");
   const val = JSON.stringify(value);
+  await ensureRuntime(tab.id);
   // Use the native value setter + input/change events so frameworks (React,
   // Vue) that track their own state pick up the change.
   const ok = await evalInPage(
     tab.id,
     `(() => {
-      const el = document.querySelector(${sel});
+      const el = ${elementExpr(spec)};
       if (!el) return false;
+      el.scrollIntoView({ block: "center", inline: "center" });
       el.focus();
       const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
@@ -4033,138 +4193,33 @@ async function cmdFill(params) {
       return true;
     })()`
   );
-  if (!ok) throw new Error(`No element for selector ${selector}`);
+  if (!ok) throw new Error(`No element for ${describeSpec(spec)}`);
+  const mark = submit ? await markPage(tab.id) : null;
   if (submit) {
     await cdpSend(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
     await cdpSend(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
   }
-  return { success: true, selector, submitted: submit };
+  return {
+    success: true,
+    ...spec,
+    submitted: submit,
+    ...(submit ? await settle(tab.id, mark, 250) : {}),
+  };
 }
 
 async function cmdSnapshot(params) {
   const tab = await resolveTab(params);
-  const max = Math.max(1, Math.min(300, Number(params?.max_elements) || 80));
+  await ensureRuntime(tab.id);
+  const options = {
+    max: Math.max(1, Math.min(300, Number(params?.max_elements) || 80)),
+    diff: Boolean(params?.diff),
+  };
   const snapshot = await evalInPage(
     tab.id,
-    `(() => {
-      const MAX = ${max};
-      const SEL = [
-        "a[href]", "area[href]", "button", "input:not([type=hidden])", "select", "textarea", "summary",
-        "[role=button]", "[role=link]", "[role=tab]", "[role=menuitem]", "[role=menuitemcheckbox]",
-        "[role=menuitemradio]", "[role=checkbox]", "[role=radio]", "[role=switch]", "[role=combobox]",
-        "[role=listbox]", "[role=option]", "[role=slider]", "[role=spinbutton]", "[role=textbox]",
-        "[role=searchbox]", "[role=treeitem]", "[contenteditable=true]", "[tabindex]:not([tabindex='-1'])", "[onclick]",
-      ].join(",");
-      const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim();
-      function cssPath(el) {
-        if (el.id) return "#" + CSS.escape(el.id);
-        const parts = [];
-        let node = el;
-        for (let depth = 0; node && node.nodeType === 1 && depth < 4; depth++) {
-          let sel = node.tagName.toLowerCase();
-          if (node.id) { parts.unshift("#" + CSS.escape(node.id)); break; }
-          const parent = node.parentElement;
-          if (parent) {
-            const sibs = Array.from(parent.children).filter((c) => c.tagName === node.tagName);
-            if (sibs.length > 1) sel += ":nth-of-type(" + (sibs.indexOf(node) + 1) + ")";
-          }
-          parts.unshift(sel);
-          node = node.parentElement;
-        }
-        return parts.join(" > ");
-      }
-      function inferredRole(el) {
-        const explicit = el.getAttribute("role");
-        if (explicit) return explicit;
-        const tag = el.tagName.toLowerCase();
-        if (tag === "a" || tag === "area") return "link";
-        if (tag === "button" || tag === "summary") return "button";
-        if (tag === "textarea" || el.isContentEditable) return "textbox";
-        if (tag === "select") return el.multiple ? "listbox" : "combobox";
-        if (tag !== "input") return tag;
-        const inputRoles = {
-          button: "button", submit: "button", reset: "button", image: "button",
-          checkbox: "checkbox", radio: "radio", range: "slider", number: "spinbutton",
-          search: "searchbox",
-        };
-        return inputRoles[el.type] || "textbox";
-      }
-      function accessibleName(el) {
-        const aria = normalize(el.getAttribute("aria-label"));
-        if (aria) return aria;
-        const labelledBy = normalize(el.getAttribute("aria-labelledby"));
-        if (labelledBy) {
-          const value = normalize(labelledBy.split(/\\s+/).map((id) => document.getElementById(id)?.textContent).join(" "));
-          if (value) return value;
-        }
-        const labels = el.labels ? normalize([...el.labels].map((label) => label.innerText || label.textContent).join(" ")) : "";
-        if (labels) return labels;
-        return normalize(
-          el.getAttribute("alt") || el.getAttribute("title") || el.getAttribute("placeholder") ||
-          el.innerText || ((el.type === "button" || el.type === "submit") ? el.value : "")
-        );
-      }
-      function controlState(el) {
-        const state = {};
-        if ("disabled" in el || el.hasAttribute("aria-disabled")) {
-          state.disabled = Boolean(el.disabled) || el.getAttribute("aria-disabled") === "true";
-        }
-        if ("checked" in el || el.hasAttribute("aria-checked")) {
-          const aria = el.getAttribute("aria-checked");
-          state.checked = aria === "mixed" ? "mixed" : (aria ? aria === "true" : Boolean(el.checked));
-        }
-        if ("selected" in el || el.hasAttribute("aria-selected")) {
-          const aria = el.getAttribute("aria-selected");
-          state.selected = aria ? aria === "true" : Boolean(el.selected);
-        }
-        for (const key of ["expanded", "pressed"]) {
-          const value = el.getAttribute("aria-" + key);
-          if (value != null) state[key] = value === "mixed" ? "mixed" : value === "true";
-        }
-        if ("required" in el || el.hasAttribute("aria-required")) {
-          state.required = Boolean(el.required) || el.getAttribute("aria-required") === "true";
-        }
-        if ("readOnly" in el && el.readOnly) state.readonly = true;
-        return state;
-      }
-      const out = [];
-      for (const el of document.querySelectorAll(SEL)) {
-        if (out.length >= MAX) break;
-        const r = el.getBoundingClientRect();
-        if (r.width === 0 || r.height === 0) continue;
-        const s = getComputedStyle(el);
-        if (s.visibility === "hidden" || s.display === "none" || s.opacity === "0") continue;
-        const isPassword = el instanceof HTMLInputElement && el.type === "password";
-        const text = normalize(el.innerText || (isPassword ? "" : el.value)).slice(0, 120);
-        const attributes = {};
-        if (el.type) attributes.type = el.type;
-        if (el.href) attributes.href = el.href;
-        if (el.getAttribute("placeholder")) attributes.placeholder = el.getAttribute("placeholder");
-        if (!isPassword && "value" in el && el.value) attributes.value = String(el.value).slice(0, 120);
-        out.push({
-          role: inferredRole(el),
-          text,
-          name: accessibleName(el).slice(0, 120),
-          selector: cssPath(el),
-          state: controlState(el),
-          attributes,
-          box: { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), w: Math.round(r.width), h: Math.round(r.height) },
-        });
-      }
-      return {
-        url: location.href,
-        title: document.title,
-        viewport: {
-          width: innerWidth,
-          height: innerHeight,
-          scrollX: Math.round(scrollX),
-          scrollY: Math.round(scrollY),
-        },
-        elements: out,
-      };
-    })()`
+    `__evoflux.snapshot(${JSON.stringify(options)})`,
   );
-  return { success: true, ...(snapshot || {}), elements: snapshot?.elements || [] };
+  if (!snapshot) throw new Error("snapshot returned nothing");
+  return { success: true, ...snapshot, elements: snapshot.elements || [] };
 }
 
 async function cmdStatus() {
