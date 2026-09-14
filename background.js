@@ -3291,14 +3291,23 @@ async function cmdExtract(params) {
   const tab = await resolveTab(params);
   const { format = "text", selector = null, max_chars = 15000 } = params || {};
   const MODE = JSON.stringify(format === "markdown" || format === "html" ? format : "text");
-  const SEL = selector ? JSON.stringify(selector) : "null";
   const MAX = Math.max(100, Math.min(200000, Number(max_chars) || 15000));
+  // Scoping by ref is the only way to read content inside a shadow root,
+  // where `document.querySelector` finds nothing.
+  const scope = params?.ref ? { ref: String(params.ref) } : null;
+  if (scope) await ensureRuntime(tab.id);
+  const ROOT = scope
+    ? elementExpr(scope)
+    : selector
+      ? `document.querySelector(${JSON.stringify(selector)})`
+      : "null";
 
   const data = await evalInPage(
     tab.id,
     `(() => {
-      const MODE = ${MODE}, SEL = ${SEL}, MAX = ${MAX};
-      const root = SEL ? document.querySelector(SEL) : (document.body || document.documentElement);
+      const MODE = ${MODE}, MAX = ${MAX};
+      const scoped = ${ROOT};
+      const root = scoped || (document.body || document.documentElement);
       const base = {
         title: document.title,
         url: location.href,
@@ -3825,19 +3834,52 @@ async function markPage(tabId) {
 async function settle(tabId, mark, waitMs = 120) {
   if (!mark) return {};
   await new Promise((resolve) => setTimeout(resolve, waitMs));
-  try {
-    const after = await evalInPage(tabId, `__evoflux.since(${JSON.stringify(mark)})`);
-    if (!after) return {};
-    const changed = {};
-    if (after.navigated) changed.navigated_to = after.url;
-    if (after.mutations) changed.dom_changes = after.mutations;
-    if (!after.navigated && !after.mutations) changed.dom_changes = 0;
-    return changed;
-  } catch {
-    // A navigation can tear the context down mid-question; the action still
-    // happened, and the caller can look for itself.
-    return {};
+  // A click that navigates leaves nothing behind to ask: the document, and
+  // the runtime living in it, are gone. Returning at that moment is what
+  // makes the next snapshot read the old page — and then look wrong, and
+  // then be taken again. Wait for the new document to be usable instead.
+  const SETTLE_LIMIT_MS = 5_000;
+  const deadline = Date.now() + SETTLE_LIMIT_MS;
+  let navigating = false;
+  while (Date.now() < deadline) {
+    let state;
+    try {
+      state = await evalInPage(
+        tabId,
+        `(() => ({
+          runtime: Boolean(globalThis.__evoflux),
+          ready: document.readyState,
+          url: location.href,
+        }))()`,
+      );
+    } catch {
+      // Between documents there is no context to evaluate in at all.
+      navigating = true;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      continue;
+    }
+    if (!state) return {};
+    if (!state.runtime) {
+      // A new document: the mark belongs to the old one.
+      navigating = true;
+      if (state.ready === "interactive" || state.ready === "complete") {
+        return { navigated_to: state.url };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      continue;
+    }
+    if (navigating) return { navigated_to: state.url };
+    try {
+      const after = await evalInPage(tabId, `__evoflux.since(${JSON.stringify(mark)})`);
+      if (!after) return {};
+      if (after.navigated) return { navigated_to: after.url };
+      return { dom_changes: after.mutations || 0 };
+    } catch {
+      navigating = true;
+      continue;
+    }
   }
+  return navigating ? { navigated_to: "(still loading)" } : {};
 }
 
 async function cmdClickSelector(params) {
