@@ -112,6 +112,14 @@ const issueCaptureBtn = document.getElementById("issueCaptureBtn");
 const reportIssueBtn = document.getElementById("reportIssueBtn");
 const issueSettingsDetail = document.getElementById("issueSettingsDetail");
 const issueAutomationCard = document.getElementById("issueAutomationCard");
+const scrapeSelectorInput = document.getElementById("scrapeSelectorInput");
+const scrapeModeSelect = document.getElementById("scrapeModeSelect");
+const scrapeLimitInput = document.getElementById("scrapeLimitInput");
+const scrapePreviewBtn = document.getElementById("scrapePreviewBtn");
+const scrapeExportBtn = document.getElementById("scrapeExportBtn");
+const scrapeSettingsDetail = document.getElementById("scrapeSettingsDetail");
+const scrapeResults = document.getElementById("scrapeResults");
+const clearScrapeBtn = document.getElementById("clearScrapeBtn");
 const retryContextBtn = document.getElementById("retryContextBtn");
 const releaseControlBtn = document.getElementById("releaseControlBtn");
 const controlOwnerDot = document.getElementById("controlOwnerDot");
@@ -209,6 +217,7 @@ let composerTrigger = null;
 let composerCatalogLoadedFor = "";
 let revertState = null;
 let lastCompletedTurnCanContinue = false;
+let scrapeWorkbenchState = { records: [], selector: "", mode: "list", limit: 25 };
 
 const APPEARANCE_ENUMS = {
   theme_preference: new Set(["system", "light", "dark"]),
@@ -724,6 +733,86 @@ function renderPanelContexts() {
   attachSelectionBtn.classList.toggle("active", currentContexts.some((context) => context.type === "selection"));
   captureRegionBtn.classList.toggle("active", regionCapture?.tab_id === activeTab?.id);
   attachFileBtn.classList.toggle("active", panelFiles.length > 0);
+}
+
+function renderScrapeWorkbench() {
+  if (!scrapeResults) return;
+  const records = scrapeWorkbenchState.records || [];
+  if (!records.length) {
+    scrapeResults.textContent = "No data yet. Pick a selector and preview the current page.";
+    return;
+  }
+  scrapeResults.textContent = JSON.stringify(records, null, 2);
+}
+
+async function runScrapeWorkbench() {
+  if (!activeTab?.id) {
+    scrapeSettingsDetail.textContent = "Open a page first to preview extraction data.";
+    return;
+  }
+  const selector = (scrapeSelectorInput?.value || "").trim();
+  const mode = scrapeModeSelect?.value || "list";
+  const limit = Math.max(1, Math.min(200, Number(scrapeLimitInput?.value || 25) || 25));
+  if (scrapeLimitInput) scrapeLimitInput.value = String(limit);
+  if (!selector) {
+    scrapeSettingsDetail.textContent = `Using default selector for ${mode} mode.`;
+  }
+  scrapePreviewBtn.disabled = true;
+  scrapeExportBtn.disabled = true;
+  scrapePreviewBtn.textContent = "Loading...";
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "scrape_page",
+      tab_id: activeTab.id,
+      selector,
+      mode,
+      limit,
+    });
+    if (!response?.ok) throw new Error(response?.error || "Could not extract page data");
+    scrapeWorkbenchState = {
+      records: Array.isArray(response.records) ? response.records : [],
+      selector: response.selector || selector,
+      mode,
+      limit,
+    };
+    renderScrapeWorkbench();
+    scrapeSettingsDetail.textContent = `Previewed ${scrapeWorkbenchState.records.length} record${scrapeWorkbenchState.records.length === 1 ? "" : "s"} from ${mode === "table" ? "table rows" : "matching items"}.`;
+    setComposerStatus("Scraping preview ready.");
+  } catch (error) {
+    scrapeSettingsDetail.textContent = error.message || String(error);
+    setComposerStatus(error.message || String(error), "error");
+  } finally {
+    scrapePreviewBtn.disabled = false;
+    scrapeExportBtn.disabled = false;
+    scrapePreviewBtn.textContent = "Preview";
+  }
+}
+
+function exportScrapeWorkbench() {
+  if (!scrapeWorkbenchState.records.length) {
+    scrapeSettingsDetail.textContent = "There is no preview to export yet.";
+    return;
+  }
+  const jsonString = JSON.stringify(scrapeWorkbenchState.records, null, 2);
+  const blob = new Blob([jsonString], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `webbridge-scrape-${Date.now()}.json`;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+  scrapeSettingsDetail.textContent = `Exported ${scrapeWorkbenchState.records.length} record${scrapeWorkbenchState.records.length === 1 ? "" : "s"}.`;
+}
+
+function clearScrapeWorkbench() {
+  scrapeWorkbenchState = { records: [], selector: "", mode: "list", limit: 25 };
+  if (scrapeSelectorInput) scrapeSelectorInput.value = "";
+  if (scrapeModeSelect) scrapeModeSelect.value = "list";
+  if (scrapeLimitInput) scrapeLimitInput.value = "25";
+  renderScrapeWorkbench();
+  scrapeSettingsDetail.textContent = "Use a selector such as table, li, article, or .card.";
 }
 
 async function removePanelContext(type) {
@@ -3602,6 +3691,9 @@ teachActionBtn.addEventListener("click", () => void runTeachAction());
 discardTeachBtn.addEventListener("click", () => void discardTeachRecording());
 issueCaptureBtn.addEventListener("click", () => void toggleIssueCapture());
 reportIssueBtn.addEventListener("click", () => void reportIssue());
+scrapePreviewBtn.addEventListener("click", () => void runScrapeWorkbench());
+scrapeExportBtn.addEventListener("click", () => void exportScrapeWorkbench());
+clearScrapeBtn.addEventListener("click", () => void clearScrapeWorkbench());
 retryContextBtn.addEventListener("click", () => void retryBrowserContext());
 releaseControlBtn.addEventListener("click", () => void releaseBrowserControl());
 newGroupedTabBtn.addEventListener("click", () => void openGroupedTab());

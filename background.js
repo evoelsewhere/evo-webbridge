@@ -3423,6 +3423,65 @@ async function cmdExtractElements(params) {
   return { success: true, records: records || [], count: (records || []).length };
 }
 
+async function cmdScrapeWorkbench(params) {
+  const tab = await resolveTab(params);
+  const mode = String(params?.mode || "list").toLowerCase();
+  const rawSelector = String(params?.selector || "").trim();
+  const selector = rawSelector || (mode === "table" ? "table" : "li, article, [role='listitem'], .card, .row");
+  const limit = Math.max(1, Math.min(200, Number(params?.limit) || 25));
+  await ensureRuntime(tab.id);
+
+  const records = await evalInPage(
+    tab.id,
+    `(() => {
+      const mode = ${JSON.stringify(mode)};
+      const selector = ${JSON.stringify(selector)};
+      const limit = ${limit};
+      const text = (node) => ((node && (node.innerText || node.textContent || "")) || "").replace(/\s+/g, " ").trim();
+      const candidates = __evoflux.queryAll(document, selector, true, Math.min(limit * 4, 500));
+      const entries = [];
+
+      if (mode === "table") {
+        const tables = candidates.filter((node) => node && node.tagName && node.tagName.toLowerCase() === "table");
+        tables.forEach((table, tableIndex) => {
+          const rows = [...table.querySelectorAll("tr")].filter((row) => row.querySelector("th, td"));
+          if (!rows.length) return;
+          const tablePrefix = tables.length > 1 ? "T" + (tableIndex + 1) + "_" : "";
+          const headers = [...rows[0].querySelectorAll("th, td")].map((cell, index) => {
+            const value = text(cell) || ("column_" + (index + 1));
+            return tablePrefix + value;
+          });
+          for (const row of rows.slice(1)) {
+            const cells = [...row.querySelectorAll("th, td")].map((cell) => text(cell));
+            const record = {};
+            headers.forEach((header, index) => {
+              record[header] = cells[index] || "";
+            });
+            entries.push(record);
+            if (entries.length >= limit) break;
+          }
+        });
+        return entries.slice(0, limit);
+      }
+
+      for (const item of candidates) {
+        const value = text(item);
+        const link = (item.matches && item.matches("a[href]")) ? item : (item.querySelector && item.querySelector("a[href]"));
+        const record = {
+          text: value || "",
+          href: link ? link.href : null,
+        };
+        if (!record.text && !record.href) continue;
+        entries.push(record);
+        if (entries.length >= limit) break;
+      }
+      return entries;
+    })()`
+  );
+
+  return { success: true, records: records || [], count: (records || []).length, selector };
+}
+
 async function cmdScrollToBottom(params) {
   const tab = await resolveTab(params);
   const max = Math.max(1, Math.min(100, Number(params?.max_scrolls) || 10));
@@ -4497,6 +4556,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const tab = await chrome.tabs.get(sender.tab.id);
         const recording = await recordTeachAction(tab, msg.action, sender.url || "");
         sendResponse({ ok: true, recording });
+      } catch (e) {
+        sendResponse({ ok: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.type === "scrape_page") {
+    (async () => {
+      try {
+        const tab = msg.tab_id != null ? await chrome.tabs.get(msg.tab_id) : await getActiveTab();
+        if (!tab?.id) throw new Error("No active browser tab");
+        const response = await cmdScrapeWorkbench({
+          tab_id: tab.id,
+          selector: typeof msg.selector === "string" ? msg.selector : "",
+          mode: typeof msg.mode === "string" ? msg.mode : "list",
+          limit: Number(msg.limit) || 25,
+        });
+        sendResponse({ ok: true, ...response, records: response?.records || [] });
       } catch (e) {
         sendResponse({ ok: false, error: e.message });
       }
