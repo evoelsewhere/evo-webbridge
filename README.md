@@ -92,6 +92,20 @@ Chrome DevTools Protocol (`chrome.debugger`):
   `%s/%d/%i/%f/%o/%O/%c` like DevTools. Requests the previous document left
   unfinished when the main frame navigates are marked abandoned and leave the
   current page's scope.
+- **Hot updates** — console messages from Vite, webpack(-dev-server) and Next
+  Fast Refresh are classified as connected/updating/updated/reload/error
+  events, and `readDevOverlay` reads the dev server's build-error overlay.
+  wait_for_hmr (`wait_ms`) returns `updated`, `reloaded`, `error` (with the
+  overlay; `still_broken` when an existing overlay outlives the wait) or
+  `timeout`, counting events since the previous wait_for_hmr/debug_summary. A
+  success waits 600 ms for a following failure; an overlay present before the
+  edit does not count as the edit failing. debug_summary returns the overlay,
+  new hot updates, attached cross-origin frames, and a `resolved` count of
+  errors fixed by a later update.
+- **Cross-origin frames** — while recording, `Target.setAutoAttach` (flatten)
+  attaches OOPIFs as child sessions (Chrome 125+); their Runtime/Network/Log
+  events enter the tab log with `frame_url`, their script ids are not mixed
+  with the top frame's, and their navigations do not move the page scope.
 
 Screenshots are captured at CSS-pixel scale (`clip.scale = 1`), so a click at
 the x,y a model reads off the image lands correctly even on HiDPI/Retina

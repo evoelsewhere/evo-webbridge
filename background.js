@@ -91,7 +91,7 @@ const COMMAND_CAPABILITIES = [
   "snapshot", "semantic_snapshot", "semantic_read", "semantic_select",
   "semantic_write", "extract_elements", "scroll_to_bottom", "resize",
   "reset_viewport", "dialogs", "handle_dialog", "status", "batch",
-  "console", "network", "network_body", "debug_summary",
+  "console", "network", "network_body", "debug_summary", "wait_for_hmr",
   "storage", "cookies", "inspect", "upload_file", "emulate", "mock", "performance",
 ];
 
@@ -1848,6 +1848,9 @@ async function runCommand(action, params) {
       case "debug_summary":
         result = await cmdDebugSummary(params);
         break;
+      case "wait_for_hmr":
+        result = await cmdWaitForHmr(params);
+        break;
       case "storage":
         result = await cmdStorage(params);
         break;
@@ -3006,6 +3009,14 @@ function newDevtoolsLog() {
     scripts: new Map(),
     // Whether a document has loaded since recording began.
     navigated: false,
+    navigations: 0,
+    // sessionId → { url } of attached cross-origin frames.
+    children: new Map(),
+    // Dev-server hot-update events, and the log position the last
+    // wait_for_hmr / debug_summary read up to.
+    hmr: [],
+    hmr_mark: 0,
+    hmr_nav_mark: 0,
   };
 }
 
@@ -3029,6 +3040,51 @@ async function enableDevtoolsDomains(tabId) {
       console.warn("[WebBridge] Source maps unavailable:", error.message);
     }
   }
+  // Cross-origin iframes run in their own renderer, so their console and
+  // requests never reach the tab's session. Auto-attach hands each one to us
+  // as a child session (flattened — Chrome 125+ lets chrome.debugger address
+  // it by sessionId); older browsers simply record the top frame only.
+  await sendCommandOnce(tabId, "Target.setAutoAttach", {
+    autoAttach: true,
+    waitForDebuggerOnStart: false,
+    flatten: true,
+  }).catch((error) => {
+    console.warn("[WebBridge] Cross-origin frames not recorded:", error.message);
+  });
+}
+
+function sendChildCommand(tabId, sessionId, method, params = {}) {
+  return new Promise((resolve, reject) => {
+    chrome.debugger.sendCommand({ tabId, sessionId }, method, params, (result) => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve(result);
+    });
+  });
+}
+
+// A cross-origin frame attached (or went away): record its console, errors
+// and requests into the tab's log, labelled with the frame's address.
+function handleChildTarget(tabId, method, params) {
+  const log = devtoolsLogs.get(tabId);
+  if (method === "Target.detachedFromTarget") {
+    log?.children.delete(params.sessionId);
+    return;
+  }
+  const info = params.targetInfo || {};
+  if (!log || info.type !== "iframe" || !params.sessionId) return;
+  log.children.set(params.sessionId, { url: info.url || "", target_id: info.targetId });
+  const sessionId = params.sessionId;
+  Promise.all([
+    sendChildCommand(tabId, sessionId, "Runtime.enable"),
+    sendChildCommand(tabId, sessionId, "Network.enable"),
+    sendChildCommand(tabId, sessionId, "Log.enable").catch(() => ({})),
+  ])
+    .catch((error) => console.warn("[WebBridge] Frame not recorded:", error.message))
+    .finally(() => {
+      if (params.waitingForDebugger) {
+        sendChildCommand(tabId, sessionId, "Runtime.runIfWaitingForDebugger").catch(() => {});
+      }
+    });
 }
 
 // Start the tab's devtools log if it is not running. Returns true when it
@@ -3398,11 +3454,83 @@ function pushNetwork(log, id, entry) {
   }
 }
 
-function recordDevtoolsEvent(tabId, method, params) {
+// Dev-server hot-update messages, as Vite, webpack(-dev-server) and Next's
+// Fast Refresh print them in the page console.
+const HMR_PATTERNS = [
+  [/^\[vite\] hot updated: (.+)/i, "updated"],
+  [/^\[vite\] (?:page reload|full reload)\b/i, "reload"],
+  [/^\[vite\] connected/i, "connected"],
+  [/^\[vite\] server connection lost/i, "disconnected"],
+  [/^\[(?:hmr|vite)\] Failed to reload /i, "error"],
+  [/^\[vite\] (?:Internal Server Error|error\b)/i, "error"],
+  [/^\[Fast Refresh\] rebuilding/i, "updating"],
+  [/^\[Fast Refresh\] done/i, "updated"],
+  [/^\[HMR\] (?:Cannot apply update|The following modules couldn't be hot updated)/i, "reload"],
+  [/^\[HMR\] (?:Updated modules|App is up to date)/i, "updated"],
+  [/^\[HMR\] connected/i, "connected"],
+  [/^\[webpack-dev-server\] (?:Errors while compiling|Error)/i, "error"],
+  [/^\[webpack-dev-server\] App updated\. Recompiling/i, "updating"],
+  [/^\[webpack-dev-server\] (?:Server started|Hot Module Replacement enabled)/i, "connected"],
+  [/^\[webpack-dev-server\] Disconnected/i, "disconnected"],
+];
+const MAX_HMR_EVENTS = 50;
+
+// Record a hot-update message; returns its kind, or null for other text.
+function noteHmr(log, text) {
+  const line = String(text || "").trimStart();
+  for (const [pattern, kind] of HMR_PATTERNS) {
+    if (!pattern.test(line)) continue;
+    const updated = kind === "updated" ? line.match(/hot updated: (\S+)/i) : null;
+    log.hmr.push({
+      seq: log.seq,
+      ts: Date.now(),
+      kind,
+      detail: line.split("\n")[0].slice(0, 300),
+      ...(updated ? { path: updated[1] } : {}),
+    });
+    if (log.hmr.length > MAX_HMR_EVENTS) log.hmr.splice(0, log.hmr.length - MAX_HMR_EVENTS);
+    return kind;
+  }
+  return null;
+}
+
+// An error the dev server has since fixed: a failed hot update followed by a
+// successful one, or a failed load of a module that was later hot-updated.
+// It stays in console/network, but is no longer the page's state.
+function resolvedByLaterUpdate(log, entry) {
+  return log.hmr.some(
+    (event) =>
+      event.seq > entry.seq &&
+      (event.kind === "updated" || event.kind === "reload") &&
+      (entry.hmr === "error" || (event.path && String(entry.url || "").includes(event.path))),
+  );
+}
+
+function recordDevtoolsEvent(tabId, method, params, sessionId = null) {
   const log = devtoolsLogs.get(tabId);
   if (!log) return;
+  // A cross-origin frame's events carry its address; its script ids live in
+  // another renderer and must not be looked up among the top frame's.
+  const child = sessionId ? log.children.get(sessionId) : null;
+  // A frame is attached before it navigates, so its address arrives later:
+  // with its main world, or its document request.
+  if (child && method === "Runtime.executionContextCreated") {
+    const context = params.context || {};
+    if (context.auxData?.isDefault && /^https?:/.test(context.origin || "")) child.url = context.origin;
+    return;
+  }
+  if (child && method === "Network.requestWillBeSent" && params.type === "Document") {
+    child.url = params.request?.url || child.url;
+  }
+  const frameTag = child ? { frame_url: redactUrl(child.url) } : {};
+  const ownFrames = (stackTrace) => {
+    const frames = rawFrames(stackTrace);
+    if (sessionId) frames.forEach((frame) => { frame.script_id = ""; });
+    return frames;
+  };
   if (method === "Page.frameNavigated") {
-    if (!params.frame || params.frame.parentId) return;
+    if (sessionId || !params.frame || params.frame.parentId) return;
+    log.navigations += 1;
     // The page begins with the request for its document, sent (and maybe
     // redirected) before the frame commits — not at the commit itself.
     let first = log.seq;
@@ -3436,24 +3564,28 @@ function recordDevtoolsEvent(tabId, method, params) {
     const top = params.stackTrace?.callFrames?.[0];
     const level = consoleLevel(params.type);
     const withStack = level === "error" || level === "warning";
-    const frames = rawFrames(params.stackTrace);
+    const frames = ownFrames(params.stackTrace);
+    const text = redactSecrets(consoleArgsText(params.args));
     pushConsole(log, {
       source: "console",
       level,
-      text: redactSecrets(consoleArgsText(params.args)),
+      text,
       ...(top ? { url: redactUrl(top.url || ""), line: top.lineNumber + 1, column: top.columnNumber + 1 } : {}),
       ...(frames.length ? { frames: withStack ? frames : frames.slice(0, 1), with_stack: withStack } : {}),
+      ...frameTag,
     });
+    const hmrKind = sessionId ? null : noteHmr(log, text);
+    if (hmrKind) log.console[log.console.length - 1].hmr = hmrKind;
   } else if (method === "Runtime.exceptionThrown") {
     const details = params.exceptionDetails || {};
-    let frames = rawFrames(details.stackTrace);
+    let frames = ownFrames(details.stackTrace);
     if (!frames.length && details.url) {
       frames = [{
         fn: "",
         url: details.url,
         line: Number(details.lineNumber) || 0,
         column: Number(details.columnNumber) || 0,
-        script_id: details.scriptId || "",
+        script_id: sessionId ? "" : details.scriptId || "",
       }];
     }
     const description = details.exception?.description || details.text || "Uncaught exception";
@@ -3463,9 +3595,10 @@ function recordDevtoolsEvent(tabId, method, params) {
       text: redactSecrets(frames.length ? messageOnly(description) : description),
       ...(details.url ? { url: redactUrl(details.url), line: details.lineNumber + 1, column: details.columnNumber + 1 } : {}),
       ...(frames.length ? { frames, with_stack: true } : {}),
+      ...frameTag,
     });
   } else if (method === "Debugger.scriptParsed") {
-    if (!log.source_maps || !params.sourceMapURL) return;
+    if (sessionId || !log.source_maps || !params.sourceMapURL) return;
     log.scripts.set(params.scriptId, { url: params.url || "", map: params.sourceMapURL });
     if (log.scripts.size > MAX_TRACKED_SCRIPTS) log.scripts.delete(log.scripts.keys().next().value);
   } else if (method === "Log.entryAdded") {
@@ -3475,6 +3608,7 @@ function recordDevtoolsEvent(tabId, method, params) {
       level: consoleLevel(entry.level),
       text: redactSecrets(entry.text || ""),
       ...(entry.url ? { url: redactUrl(entry.url), ...(entry.lineNumber != null ? { line: entry.lineNumber + 1 } : {}) } : {}),
+      ...frameTag,
     });
   } else if (method === "Network.requestWillBeSent") {
     const id = params.requestId;
@@ -3503,6 +3637,7 @@ function recordDevtoolsEvent(tabId, method, params) {
       started_at: Date.now(),
       wall: params.timestamp,
       done: false,
+      ...frameTag,
     });
   } else if (method === "Network.responseReceived") {
     const entry = log.network.get(params.requestId);
@@ -3674,10 +3809,17 @@ async function cmdDebugSummary(params) {
   const limit = Math.max(1, Math.min(50, Number(params?.limit) || 10));
   const pageConsole = log.console.filter((entry) => inDevtoolsScope(log, entry, "page"));
   const pageNetwork = [...log.network.values()].filter((entry) => inDevtoolsScope(log, entry, "page"));
-  const errors = pageConsole.filter((entry) => entry.level === "error");
+  const allErrors = pageConsole.filter((entry) => entry.level === "error");
+  const errors = allErrors.filter((entry) => !resolvedByLaterUpdate(log, entry));
   const warnings = pageConsole.filter((entry) => entry.level === "warning");
-  const failed = pageNetwork.filter(networkEntryFailed);
+  const allFailed = pageNetwork.filter(networkEntryFailed);
+  const failed = allFailed.filter((entry) => !resolvedByLaterUpdate(log, entry));
   const current = await chrome.tabs.get(tab.id);
+  const overlay = await readDevOverlay(tab.id).catch(() => null);
+  const hmr = log.hmr.filter((event) => event.seq > log.hmr_mark);
+  // What this summary reported is what the next wait_for_hmr waits past.
+  log.hmr_mark = log.seq;
+  log.hmr_nav_mark = log.navigations;
   return {
     success: true,
     started_now: startedNow,
@@ -3697,8 +3839,117 @@ async function cmdDebugSummary(params) {
       pending: pageNetwork.filter((entry) => !entry.done).length,
     },
     failed_requests: failed.slice(-limit).map(publicNetworkEntry),
+    // Errors a later successful hot update has fixed: kept out of the lists.
+    resolved: (allErrors.length - errors.length) + (allFailed.length - failed.length),
+    overlay,
+    hmr: hmr.slice(-5).map(({ seq: _seq, ...event }) => event),
+    frames: [...log.children.values()].map((child) => redactUrl(child.url)).filter(Boolean),
   };
 }
+
+// The error overlay a dev server paints over the page when a build fails:
+// often the only place a syntax error shows, since nothing reaches the
+// console until the module compiles.
+async function readDevOverlay(tabId) {
+  const overlay = await evalInPage(
+    tabId,
+    `(() => {
+      const clip = (value, max) => String(value || "").replace(/\\n{3,}/g, "\\n\\n").trim().slice(0, max);
+      const vite = document.querySelector("vite-error-overlay");
+      if (vite && vite.shadowRoot) {
+        const root = vite.shadowRoot;
+        return {
+          tool: "vite",
+          message: clip(root.querySelector(".message-body")?.textContent, 1500),
+          file: clip(root.querySelector(".file")?.textContent, 300),
+          frame: clip(root.querySelector(".frame")?.textContent, 1200),
+        };
+      }
+      const next = document.querySelector("nextjs-portal");
+      const nextText = clip(next && next.shadowRoot && next.shadowRoot.textContent, 2000);
+      if (/Unhandled Runtime Error|Build Error|Failed to compile|Runtime Error/.test(nextText)) {
+        return { tool: "next", message: nextText };
+      }
+      const wds = document.getElementById("webpack-dev-server-client-overlay");
+      if (wds) {
+        try {
+          const text = clip(wds.contentDocument && wds.contentDocument.body && wds.contentDocument.body.innerText, 2000);
+          if (text) return { tool: "webpack", message: text };
+        } catch {}
+      }
+      return null;
+    })()`,
+  );
+  if (!overlay) return null;
+  return Object.fromEntries(
+    Object.entries(overlay).map(([key, value]) => [key, key === "tool" ? value : redactSecrets(value)]),
+  );
+}
+
+const HMR_SETTLED = new Set(["updated", "reload", "error"]);
+
+// After an edit: did the dev server's hot update reach this page, and did it
+// apply, reload the page, or fail? Counts what happened since the previous
+// wait_for_hmr or debug_summary, so an update that landed while the model
+// was still writing its next call is not missed.
+async function cmdWaitForHmr(params) {
+  const { tab, log, startedNow } = await devtoolsLogFor(params);
+  // wait_ms bounds the wait itself; the command's timeout_ms (set above it by
+  // the caller) bounds the whole command, so the answer always gets back.
+  const timeoutMs = Math.max(500, Math.min(60000, Number(params?.wait_ms) || 10000));
+  const started = Date.now();
+  const mark = log.hmr_mark;
+  const navMark = log.hmr_nav_mark;
+  // An overlay already up when the wait starts is the build that was broken
+  // before this edit; only a new one — or the old one outliving an update —
+  // says this edit failed.
+  const overlayAtStart = await readDevOverlay(tab.id).catch(() => null);
+  let overlay = overlayAtStart;
+  let lastOverlayCheck = Date.now();
+  let settleAt = null;
+  const finish = async (outcome, extra = {}) => {
+    if (log.navigations > navMark) await waitForDomSettled(tab.id);
+    const events = log.hmr.filter((event) => event.seq > mark);
+    log.hmr_mark = log.seq;
+    log.hmr_nav_mark = log.navigations;
+    return {
+      success: true,
+      outcome,
+      waited_ms: Date.now() - started,
+      events: events.slice(-10).map(({ seq: _seq, ...event }) => event),
+      overlay,
+      started_now: startedNow,
+      ...extra,
+    };
+  };
+  for (;;) {
+    const now = Date.now();
+    if (now - lastOverlayCheck >= 200) {
+      overlay = await readDevOverlay(tab.id).catch(() => null);
+      lastOverlayCheck = Date.now();
+    }
+    const settled = log.hmr.filter((event) => event.seq > mark && HMR_SETTLED.has(event.kind));
+    const latest = settled[settled.length - 1];
+    const reloaded = log.navigations > navMark;
+    const newOverlay = overlay && overlay.message !== overlayAtStart?.message;
+    if (latest?.kind === "error" || newOverlay) return finish("error");
+    if ((latest || reloaded) && settleAt === null) settleAt = now + HMR_GRACE_MS;
+    if (settleAt !== null && now >= settleAt) {
+      // An update the build error survived did not fix it.
+      if (overlay && !reloaded) return finish("error", { still_broken: true });
+      return finish(reloaded || latest?.kind === "reload" ? "reloaded" : "updated");
+    }
+    if (now - started >= timeoutMs) {
+      return overlay ? finish("error", { still_broken: true }) : finish("timeout");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+// A success is only final once a failure could have followed it: Vite prints
+// "hot updated" before the new module has run, and a module that does not
+// compile answers with "Failed to reload" and its overlay a moment later.
+const HMR_GRACE_MS = 600;
 
 // ── Page state: storage and cookies ──────────────────────────────────────────
 
@@ -4237,7 +4488,14 @@ async function cmdPerformance(params) {
 chrome.debugger.onEvent.addListener((source, method, params) => {
   const tabId = source.tabId;
   if (!tabId || !params) return;
-  recordDevtoolsEvent(tabId, method, params);
+  if (method === "Target.attachedToTarget" || method === "Target.detachedFromTarget") {
+    handleChildTarget(tabId, method, params);
+    return;
+  }
+  recordDevtoolsEvent(tabId, method, params, source.sessionId || null);
+  // Everything below is about the tab's own page; a cross-origin frame's
+  // session only feeds the devtools log.
+  if (source.sessionId) return;
   if (method === "Fetch.requestPaused") {
     handleFetchPaused(tabId, params);
     return;
