@@ -79,6 +79,13 @@ Chrome DevTools Protocol (`chrome.debugger`):
   `<input type=file>` with `DOM.setFileInputFiles` (the backend limits paths to
   the session workspace). Mocks are re-armed after a re-attach; emulation ends
   with the debugger session.
+- **Source maps** — when recording was started by a Coding session
+  (`_webbridge_devtools: "capture"`), the extension also enables `Debugger`,
+  immediately skipping all pauses and deactivating breakpoints, solely to
+  collect `scriptParsed` source-map URLs. Console/exception frames and React 19
+  owner-stack locations are then mapped (v3 maps, inline or fetched with a 3 s
+  timeout and 15 MB cap, 24 cached) to the original sources and flagged
+  `source_mapped`. Index maps with `sections` are not mapped.
 
 Screenshots are captured at CSS-pixel scale (`clip.scale = 1`), so a click at
 the x,y a model reads off the image lands correctly even on HiDPI/Retina

@@ -2488,7 +2488,7 @@ async function resolveTab(params) {
     !devtoolsLogs.has(tab.id) &&
     browserOrigin(tab.url || tab.pendingUrl || "")
   ) {
-    await startDevtoolsLog(tab).catch((error) => {
+    await startDevtoolsLog(tab, { sourceMaps: true }).catch((error) => {
       console.warn("[WebBridge] Devtools log unavailable:", error.message);
     });
   }
@@ -2997,6 +2997,10 @@ function newDevtoolsLog() {
     network: new Map(),
     network_dropped: 0,
     redirects: 0,
+    // scriptId → { url, map } for scripts that declare a source map; only
+    // collected when source mapping is on (Coding sessions).
+    source_maps: false,
+    scripts: new Map(),
   };
 }
 
@@ -3006,16 +3010,31 @@ async function enableDevtoolsDomains(tabId) {
     sendCommandOnce(tabId, "Network.enable", {}),
     sendCommandOnce(tabId, "Log.enable", {}).catch(() => ({})),
   ]);
+  if (devtoolsLogs.get(tabId)?.source_maps) {
+    // Debugger is only here for scriptParsed (which script has which map).
+    // With it enabled a `debugger;` statement would pause the page, so all
+    // pauses are skipped before anything else can run.
+    try {
+      await sendCommandOnce(tabId, "Debugger.enable", {});
+      await sendCommandOnce(tabId, "Debugger.setSkipAllPauses", { skip: true });
+      await sendCommandOnce(tabId, "Debugger.setBreakpointsActive", { active: false });
+    } catch (error) {
+      console.warn("[WebBridge] Source maps unavailable:", error.message);
+    }
+  }
 }
 
 // Start the tab's devtools log if it is not running. Returns true when it
 // was started by this call — nothing from before this moment was recorded.
-async function startDevtoolsLog(tab) {
+// sourceMaps (Coding sessions) also tracks scripts so stacks can be mapped
+// back to the original sources.
+async function startDevtoolsLog(tab, { sourceMaps = false } = {}) {
   if (devtoolsLogs.has(tab.id)) return false;
   if (!browserOrigin(tab.url || tab.pendingUrl || "")) {
     throw new Error("Console and network are only recorded on http(s) pages.");
   }
   const log = newDevtoolsLog();
+  log.source_maps = Boolean(sourceMaps);
   log.page_url = tab.url || tab.pendingUrl || "";
   devtoolsLogs.set(tab.id, log);
   try {
@@ -3059,12 +3078,194 @@ function redactUrl(url) {
   }
 }
 
-function stackFrames(stackTrace) {
-  const frames = stackTrace?.callFrames || [];
-  return frames.slice(0, MAX_STACK_FRAMES).map((frame) => {
-    const where = `${redactUrl(frame.url || "")}:${Number(frame.lineNumber) + 1}:${Number(frame.columnNumber) + 1}`;
-    return frame.functionName ? `${frame.functionName} (${where})` : where;
-  });
+// Frames as CDP reports them (0-based), kept beside an entry so a read can
+// map them through the script's source map.
+function rawFrames(stackTrace) {
+  return (stackTrace?.callFrames || []).slice(0, MAX_STACK_FRAMES).map((frame) => ({
+    fn: frame.functionName || "",
+    url: frame.url || "",
+    line: Number(frame.lineNumber) || 0,
+    column: Number(frame.columnNumber) || 0,
+    script_id: frame.scriptId || "",
+  }));
+}
+
+function frameText(frame) {
+  const where = `${redactUrl(frame.url || "")}:${frame.line + 1}:${frame.column + 1}`;
+  return frame.fn ? `${frame.fn} (${where})` : where;
+}
+
+// An Error's description is its message followed by its stack; the stack is
+// kept (and mapped) separately, so only the message stays in the text.
+function messageOnly(description) {
+  const text = String(description || "");
+  const at = text.search(/\n\s+at /);
+  return at > 0 ? text.slice(0, at) : text;
+}
+
+// ── Source maps ──────────────────────────────────────────────────────────────
+
+const SOURCE_MAP_CACHE_SIZE = 24;
+const SOURCE_MAP_MAX_CHARS = 15 * 1024 * 1024;
+const SOURCE_MAP_FETCH_MS = 3000;
+const MAX_TRACKED_SCRIPTS = 4000;
+const sourceMapCache = new Map();
+const B64_DIGITS = new Map(
+  [..."ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"].map((c, i) => [c, i]),
+);
+
+// Source map v3 `mappings`, decoded into per-generated-line segments of
+// [generatedColumn, sourceIndex, originalLine, originalColumn]. Every field
+// but the column carries over from the previous segment, across lines.
+function decodeMappings(mappings) {
+  const lines = [];
+  let source = 0;
+  let originalLine = 0;
+  let originalColumn = 0;
+  for (const lineText of String(mappings || "").split(";")) {
+    const segments = [];
+    let column = 0;
+    for (const segmentText of lineText ? lineText.split(",") : []) {
+      const values = [];
+      let value = 0;
+      let shift = 0;
+      for (const char of segmentText) {
+        const digit = B64_DIGITS.get(char);
+        if (digit === undefined) break;
+        value += (digit & 31) * 2 ** shift;
+        if (digit & 32) {
+          shift += 5;
+        } else {
+          values.push(value & 1 ? -Math.floor(value / 2) : Math.floor(value / 2));
+          value = 0;
+          shift = 0;
+        }
+      }
+      if (!values.length) continue;
+      column += values[0];
+      if (values.length >= 4) {
+        source += values[1];
+        originalLine += values[2];
+        originalColumn += values[3];
+        segments.push([column, source, originalLine, originalColumn]);
+      } else {
+        segments.push([column]);
+      }
+    }
+    lines.push(segments);
+  }
+  return lines;
+}
+
+function sourceMapUrlFor(script) {
+  if (!script?.map) return null;
+  if (script.map.startsWith("data:")) return script.map;
+  try {
+    return new URL(script.map, script.url).href;
+  } catch {
+    return null;
+  }
+}
+
+// What a developer recognises: bundler namespaces stripped, a dev server's
+// module URL kept as is.
+function displaySource(source, mapUrl, sourceRoot) {
+  const name = `${sourceRoot || ""}${source}`;
+  if (/^webpack:\/\//.test(name)) return name.replace(/^webpack:\/\/[^/]*\//, "");
+  if (/^[a-z][a-z0-9+.-]*:/i.test(name)) return name;
+  if (mapUrl && !mapUrl.startsWith("data:")) {
+    try {
+      return new URL(name, mapUrl).href;
+    } catch {
+      return name;
+    }
+  }
+  return name;
+}
+
+async function loadSourceMap(mapUrl) {
+  if (sourceMapCache.has(mapUrl)) {
+    const cached = sourceMapCache.get(mapUrl);
+    sourceMapCache.delete(mapUrl);
+    sourceMapCache.set(mapUrl, cached);
+    return cached;
+  }
+  const pending = (async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), SOURCE_MAP_FETCH_MS);
+    try {
+      const response = await fetch(mapUrl, { signal: controller.signal, credentials: "omit" });
+      if (!response.ok) return null;
+      const text = await response.text();
+      if (text.length > SOURCE_MAP_MAX_CHARS) return null;
+      const map = JSON.parse(text.replace(/^\)\]\}'[^\n]*\n/, ""));
+      if (!map || map.sections || !Array.isArray(map.sources)) return null;
+      return {
+        sources: map.sources.map((source) => displaySource(source, mapUrl, map.sourceRoot)),
+        lines: decodeMappings(map.mappings),
+      };
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  })();
+  sourceMapCache.set(mapUrl, pending);
+  while (sourceMapCache.size > SOURCE_MAP_CACHE_SIZE) {
+    sourceMapCache.delete(sourceMapCache.keys().next().value);
+  }
+  return pending;
+}
+
+function scriptFor(log, frame) {
+  if (frame.script_id && log.scripts.has(frame.script_id)) return log.scripts.get(frame.script_id);
+  if (!frame.url) return null;
+  for (const script of log.scripts.values()) {
+    if (script.url === frame.url) return script;
+  }
+  return null;
+}
+
+// The original position of a generated (0-based) frame, or null.
+async function mapFrame(log, frame) {
+  const mapUrl = sourceMapUrlFor(scriptFor(log, frame));
+  if (!mapUrl) return null;
+  const map = await loadSourceMap(mapUrl);
+  const segments = map?.lines[frame.line];
+  if (!segments?.length) return null;
+  let found = null;
+  for (const segment of segments) {
+    if (segment[0] > frame.column) break;
+    found = segment;
+  }
+  if (!found || found.length < 4) return null;
+  return {
+    ...frame,
+    url: map.sources[found[1]] || frame.url,
+    line: found[2],
+    column: found[3],
+    mapped: true,
+  };
+}
+
+// Console entries as a read returns them: bookkeeping dropped and, where the
+// tab tracks source maps, positions moved from the bundle to the source.
+async function presentConsoleEntries(log, entries) {
+  return Promise.all(entries.map(async ({ seq: _seq, frames, ...entry }) => {
+    if (!log.source_maps || !frames?.length) return entry;
+    const mapped = await Promise.all(frames.map((frame) => mapFrame(log, frame)));
+    if (!mapped.some(Boolean)) return entry;
+    const resolved = frames.map((frame, index) => mapped[index] || frame);
+    const top = resolved[0];
+    return {
+      ...entry,
+      url: redactUrl(top.url),
+      line: top.line + 1,
+      column: top.column + 1,
+      stack: entry.stack ? resolved.map(frameText) : undefined,
+      source_mapped: true,
+    };
+  }));
 }
 
 // A console argument as DevTools would print it, from the RemoteObject CDP
@@ -3145,22 +3346,41 @@ function recordDevtoolsEvent(tabId, method, params) {
     if (params.type === "endGroup") return;
     const top = params.stackTrace?.callFrames?.[0];
     const level = consoleLevel(params.type);
+    const withStack = level === "error" || level === "warning";
+    const frames = rawFrames(params.stackTrace);
     pushConsole(log, {
       source: "console",
       level,
       text: redactSecrets((params.args || []).map(remoteObjectText).join(" ")),
       ...(top ? { url: redactUrl(top.url || ""), line: top.lineNumber + 1, column: top.columnNumber + 1 } : {}),
-      ...(level === "error" || level === "warning" ? { stack: stackFrames(params.stackTrace) } : {}),
+      ...(withStack ? { stack: frames.map(frameText) } : {}),
+      ...(frames.length ? { frames: withStack ? frames : frames.slice(0, 1) } : {}),
     });
   } else if (method === "Runtime.exceptionThrown") {
     const details = params.exceptionDetails || {};
+    let frames = rawFrames(details.stackTrace);
+    if (!frames.length && details.url) {
+      frames = [{
+        fn: "",
+        url: details.url,
+        line: Number(details.lineNumber) || 0,
+        column: Number(details.columnNumber) || 0,
+        script_id: details.scriptId || "",
+      }];
+    }
+    const description = details.exception?.description || details.text || "Uncaught exception";
     pushConsole(log, {
       source: "exception",
       level: "error",
-      text: redactSecrets(details.exception?.description || details.text || "Uncaught exception"),
+      text: redactSecrets(frames.length ? messageOnly(description) : description),
       ...(details.url ? { url: redactUrl(details.url), line: details.lineNumber + 1, column: details.columnNumber + 1 } : {}),
-      stack: stackFrames(details.stackTrace),
+      stack: frames.map(frameText),
+      ...(frames.length ? { frames } : {}),
     });
+  } else if (method === "Debugger.scriptParsed") {
+    if (!log.source_maps || !params.sourceMapURL) return;
+    log.scripts.set(params.scriptId, { url: params.url || "", map: params.sourceMapURL });
+    if (log.scripts.size > MAX_TRACKED_SCRIPTS) log.scripts.delete(log.scripts.keys().next().value);
   } else if (method === "Log.entryAdded") {
     const entry = params.entry || {};
     pushConsole(log, {
@@ -3240,7 +3460,9 @@ const DEVTOOLS_FRESH_MS = 1500;
 
 async function devtoolsLogFor(params) {
   const tab = await resolveTab(params);
-  const startedNow = await startDevtoolsLog(tab);
+  const startedNow = await startDevtoolsLog(tab, {
+    sourceMaps: params?._webbridge_devtools === "capture",
+  });
   const log = devtoolsLogs.get(tab.id);
   return { tab, log, startedNow: startedNow || Date.now() - log.started_at < DEVTOOLS_FRESH_MS };
 }
@@ -3257,7 +3479,7 @@ async function cmdConsole(params) {
       (CONSOLE_LEVELS[entry.level] ?? 1) >= minimum &&
       (!needle || entry.text.toLowerCase().includes(needle)),
   );
-  const entries = matched.slice(-limit).map(({ seq: _seq, ...entry }) => entry);
+  const entries = await presentConsoleEntries(log, matched.slice(-limit));
   const result = {
     success: true,
     started_now: startedNow,
@@ -3377,8 +3599,8 @@ async function cmdDebugSummary(params) {
       warning: warnings.length,
       total: pageConsole.length,
     },
-    errors: errors.slice(-limit).map(({ seq: _seq, ...entry }) => entry),
-    warnings: warnings.slice(-Math.min(limit, 5)).map(({ seq: _seq, ...entry }) => entry),
+    errors: await presentConsoleEntries(log, errors.slice(-limit)),
+    warnings: await presentConsoleEntries(log, warnings.slice(-Math.min(limit, 5))),
     network_counts: {
       total: pageNetwork.length,
       failed: failed.length,
@@ -3627,6 +3849,18 @@ async function cmdInspect(params) {
       return (${inspectInPage.toString()})(el, ${JSON.stringify(properties)}); })()`,
   );
   if (!data) throw new Error(`No element for ${describeSpec(spec)}`);
+  // An owner-stack location (React 19) points into the served module; map it
+  // back to the source line the developer wrote.
+  const log = devtoolsLogs.get(tab.id);
+  if (log?.source_maps) {
+    data.components = await Promise.all((data.components || []).map(async (item) => {
+      if (!/^https?:/.test(item.file || "") || !item.line) return item;
+      const mapped = await mapFrame(log, {
+        url: item.file, line: item.line - 1, column: (item.column || 1) - 1, script_id: "",
+      });
+      return mapped ? { ...item, file: mapped.url, line: mapped.line + 1, column: mapped.column + 1 } : item;
+    }));
+  }
   return { success: true, ...data };
 }
 
@@ -4105,7 +4339,7 @@ async function landedPage(tabId, requestedUrl, loaded, params = {}) {
     // Coming from a page the debugger cannot record (chrome://newtab), the
     // load itself went unseen; start now and say so.
     if (params?._webbridge_devtools === "capture" && !devtoolsLogs.has(tabId)) {
-      devtoolsStarted = await startDevtoolsLog(current).catch(() => false);
+      devtoolsStarted = await startDevtoolsLog(current, { sourceMaps: true }).catch(() => false);
     }
   }
   await broadcastTabInfo();
