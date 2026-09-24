@@ -65,6 +65,20 @@ Chrome DevTools Protocol (`chrome.debugger`):
   values (Bearer tokens, JWTs, cookies, secret-named query parameters and JSON
   keys) are redacted; paths and identifiers are kept for debugging. This is
   separate from the user's opt-in **Report issue evidence** capture below.
+- **Inspecting and shaping the page** — inspect returns an element's box,
+  computed styles, attributes and, in development builds, the rendering
+  component chain with source locations (React `_debugSource`/owner stacks,
+  Vue `__file`, Svelte `__svelte_meta`, locator-plugin data attributes).
+  mock fulfils or fails requests matching a URL glob via `Fetch` interception
+  (every paused request is answered — unmatched ones continue untouched);
+  emulate sets network presets, CPU throttling, geolocation, time zone and
+  locale; performance reports navigation timing, FCP/LCP/CLS, slowest
+  interaction/resources and `Performance.getMetrics` counters. storage lists
+  local/session keys (values on request) and cookies reads `Network.getCookies`
+  — HttpOnly values are returned only for loopback pages. upload_file sets an
+  `<input type=file>` with `DOM.setFileInputFiles` (the backend limits paths to
+  the session workspace). Mocks are re-armed after a re-attach; emulation ends
+  with the debugger session.
 
 Screenshots are captured at CSS-pixel scale (`clip.scale = 1`), so a click at
 the x,y a model reads off the image lands correctly even on HiDPI/Retina

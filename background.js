@@ -92,6 +92,7 @@ const COMMAND_CAPABILITIES = [
   "semantic_write", "extract_elements", "scroll_to_bottom", "resize",
   "reset_viewport", "dialogs", "handle_dialog", "status", "batch",
   "console", "network", "network_body", "debug_summary",
+  "storage", "cookies", "inspect", "upload_file", "emulate", "mock", "performance",
 ];
 
 // Bumped when the agent-facing behaviour of the commands changes, so the
@@ -1847,6 +1848,27 @@ async function runCommand(action, params) {
       case "debug_summary":
         result = await cmdDebugSummary(params);
         break;
+      case "storage":
+        result = await cmdStorage(params);
+        break;
+      case "cookies":
+        result = await cmdCookies(params);
+        break;
+      case "inspect":
+        result = await cmdInspect(params);
+        break;
+      case "upload_file":
+        result = await cmdUploadFile(params);
+        break;
+      case "emulate":
+        result = await cmdEmulate(params);
+        break;
+      case "mock":
+        result = await cmdMock(params);
+        break;
+      case "performance":
+        result = await cmdPerformance(params);
+        break;
       case "screenshot":
         result = await cmdScreenshot(params);
         break;
@@ -2658,6 +2680,8 @@ async function ensureDebuggerAttached(tabId, { showControl = true } = {}) {
   // A re-attach (after a detach Chrome did on its own) must keep feeding a
   // devtools log the agent is already reading.
   if (devtoolsLogs.has(tabId)) await enableDevtoolsDomains(tabId);
+  // Likewise the tab's request mocks: interception ends with the session.
+  if (tabMocks.has(tabId)) await syncFetchInterception(tabId).catch(() => {});
   if (showControl) {
     await setAgentControlOverlay(tabId, true);
     notifyAutomationState("browser_control", tabId);
@@ -3364,10 +3388,532 @@ async function cmdDebugSummary(params) {
   };
 }
 
+// ── Page state: storage and cookies ──────────────────────────────────────────
+
+const MAX_STORAGE_KEYS = 200;
+const MAX_STORAGE_VALUE = 2000;
+
+function isLoopbackHost(host) {
+  const value = String(host || "").toLowerCase().replace(/^\[|\]$/g, "");
+  return (
+    value === "localhost" ||
+    value.endsWith(".localhost") ||
+    value === "::1" ||
+    /^127\.\d+\.\d+\.\d+$/.test(value)
+  );
+}
+
+function clip(value, max) {
+  const text = String(value ?? "");
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+async function cmdStorage(params) {
+  const tab = await resolveTab(params);
+  if (!browserOrigin(tab.url || "")) throw new Error("storage needs an http(s) page");
+  const area = params?.area === "session" ? "sessionStorage" : "localStorage";
+  const operation = String(params?.operation || "get");
+  const key = params?.key == null ? null : String(params.key);
+  const includeValues = Boolean(params?.include_values);
+  if ((operation === "set" || operation === "remove") && key == null) {
+    throw new Error(`storage ${operation} needs a key`);
+  }
+  const result = await evalInPage(
+    tab.id,
+    `((area, operation, key, value, includeValues, maxKeys, maxValue) => {
+      const store = globalThis[area];
+      if (operation === "set") { store.setItem(key, value); return { changed: 1 }; }
+      if (operation === "remove") { const had = store.getItem(key) !== null; store.removeItem(key); return { changed: had ? 1 : 0 }; }
+      if (operation === "clear") { const n = store.length; store.clear(); return { changed: n }; }
+      const keys = [];
+      for (let i = 0; i < store.length; i++) keys.push(store.key(i));
+      keys.sort();
+      const picked = key == null ? keys : keys.filter((k) => k === key);
+      return {
+        total: keys.length,
+        entries: picked.slice(0, maxKeys).map((k) => {
+          const v = store.getItem(k) || "";
+          return includeValues
+            ? { key: k, size: v.length, value: v.length > maxValue ? v.slice(0, maxValue - 1) + "…" : v }
+            : { key: k, size: v.length };
+        }),
+      };
+    })(${JSON.stringify(area)}, ${JSON.stringify(operation)}, ${JSON.stringify(key)},
+       ${JSON.stringify(params?.value == null ? "" : String(params.value))},
+       ${includeValues}, ${MAX_STORAGE_KEYS}, ${MAX_STORAGE_VALUE})`,
+  );
+  return { success: true, area: params?.area === "session" ? "session" : "local", operation, ...result };
+}
+
+async function cmdCookies(params) {
+  const tab = await resolveTab(params);
+  const pageUrl = tab.url || "";
+  if (!browserOrigin(pageUrl)) throw new Error("cookies needs an http(s) page");
+  await ensureDebuggerAttached(tab.id);
+  const operation = String(params?.operation || "get");
+  if (operation === "set") {
+    if (!params?.name) throw new Error("cookies set needs a name");
+    const cookie = {
+      name: String(params.name),
+      value: String(params.value ?? ""),
+      path: params.path ? String(params.path) : "/",
+      secure: Boolean(params.secure),
+      httpOnly: Boolean(params.http_only),
+    };
+    if (params.domain) cookie.domain = String(params.domain);
+    else cookie.url = pageUrl;
+    if (params.same_site) cookie.sameSite = String(params.same_site);
+    if (params.max_age != null) cookie.expires = Date.now() / 1000 + Number(params.max_age);
+    const set = await cdpSend(tab.id, "Network.setCookie", cookie, { showControl: false });
+    if (set && set.success === false) throw new Error("The browser refused the cookie");
+    return { success: true, operation, changed: 1 };
+  }
+  if (operation === "delete") {
+    if (!params?.name) throw new Error("cookies delete needs a name");
+    const target = { name: String(params.name) };
+    if (params.domain) target.domain = String(params.domain);
+    else target.url = pageUrl;
+    if (params.path) target.path = String(params.path);
+    await cdpSend(tab.id, "Network.deleteCookies", target, { showControl: false });
+    return { success: true, operation, changed: 1 };
+  }
+  const { cookies = [] } = await cdpSend(
+    tab.id, "Network.getCookies", { urls: [pageUrl] }, { showControl: false },
+  );
+  // HttpOnly exists so page scripts cannot read a session cookie; an agent
+  // driving a real, logged-in browser gets the same deal except on the
+  // developer's own loopback server.
+  const loopback = isLoopbackHost(new URL(pageUrl).hostname);
+  const includeValues = Boolean(params?.include_values);
+  const name = params?.name ? String(params.name) : null;
+  const entries = cookies
+    .filter((c) => !name || c.name === name)
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((c) => ({
+      name: c.name,
+      domain: c.domain,
+      path: c.path,
+      size: c.size,
+      http_only: Boolean(c.httpOnly),
+      secure: Boolean(c.secure),
+      same_site: c.sameSite || "",
+      expires: c.session ? "session" : c.expires,
+      ...(includeValues
+        ? { value: c.httpOnly && !loopback ? "[HttpOnly — redacted]" : clip(c.value, MAX_STORAGE_VALUE) }
+        : {}),
+    }));
+  return { success: true, operation: "get", total: entries.length, entries };
+}
+
+// ── Element inspection: box, computed style, owning component and source ─────
+
+const DEFAULT_INSPECT_STYLES = [
+  "display", "position", "top", "left", "z-index", "width", "height",
+  "margin", "padding", "box-sizing", "overflow", "visibility", "opacity",
+  "pointer-events", "color", "background-color", "font-family", "font-size",
+  "font-weight", "line-height", "flex-direction", "justify-content",
+  "align-items", "gap", "grid-template-columns", "transform", "cursor",
+];
+
+// Runs in the page. Framework hooks are read only where development builds
+// leave them; a production bundle simply reports no source.
+function inspectInPage(el, properties) {
+  const pick = (obj, keys) => Object.fromEntries(keys.map((k) => [k, obj.getPropertyValue(k)]));
+  const rect = el.getBoundingClientRect();
+  const style = getComputedStyle(el);
+  const attributes = {};
+  for (const attr of Array.from(el.attributes || []).slice(0, 30)) {
+    if (attr.name === "style" || attr.name.startsWith("on")) continue;
+    if (el.tagName === "INPUT" && attr.name === "value") continue;
+    attributes[attr.name] = String(attr.value).slice(0, 200);
+  }
+  const components = [];
+  let framework = "";
+  const frame = (stack) => {
+    // First frame outside the framework itself: where the JSX was written.
+    const lines = String(stack || "").split("\n").slice(1);
+    for (const line of lines) {
+      const m = line.match(/\(?((?:https?|webpack|file):\/\/[^\s)]+?):(\d+):(\d+)\)?\s*$/);
+      if (!m) continue;
+      if (/node_modules|react-dom|react\.development|scheduler|\/@react-refresh|chunk-[A-Z0-9]+\.js/i.test(m[1])) continue;
+      return { file: m[1], line: Number(m[2]), column: Number(m[3]) };
+    }
+    return null;
+  };
+  const reactKey = Object.keys(el).find((k) => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"));
+  if (reactKey) {
+    framework = "react";
+    let fiber = el[reactKey];
+    let rendered = null;
+    while (fiber && components.length < 8) {
+      const type = fiber.type;
+      if (!rendered && fiber._debugStack) rendered = frame(fiber._debugStack.stack);
+      if (typeof type === "function" || (type && typeof type === "object" && (type.render || type.type))) {
+        const inner = type.render || type.type || type;
+        const name = type.displayName || inner.displayName || inner.name || "Anonymous";
+        const src = fiber._debugSource || null;
+        const at = src
+          ? { file: src.fileName, line: src.lineNumber, column: src.columnNumber }
+          : fiber._debugStack ? frame(fiber._debugStack.stack) : null;
+        components.push({ name, ...(at || {}) });
+      }
+      fiber = fiber.return;
+    }
+    if (rendered && components.length && !components[0].file) Object.assign(components[0], rendered);
+  } else if (el.__vueParentComponent || el.closest?.("[data-v-app]")) {
+    framework = "vue";
+    let instance = el.__vueParentComponent;
+    if (!instance) {
+      for (let node = el; node && !instance; node = node.parentElement) instance = node.__vueParentComponent;
+    }
+    while (instance && components.length < 8) {
+      const type = instance.type || {};
+      components.push({ name: type.name || type.__name || "Anonymous", ...(type.__file ? { file: type.__file } : {}) });
+      instance = instance.parent;
+    }
+  } else if (el.__vue__) {
+    framework = "vue2";
+    let vm = el.__vue__;
+    while (vm && components.length < 8) {
+      components.push({ name: vm.$options?.name || vm.$options?._componentTag || "Anonymous", ...(vm.$options?.__file ? { file: vm.$options.__file } : {}) });
+      vm = vm.$parent;
+    }
+  } else {
+    for (let node = el; node && components.length < 8; node = node.parentElement) {
+      const loc = node.__svelte_meta?.loc;
+      if (loc) {
+        framework = "svelte";
+        components.push({ name: node.tagName.toLowerCase(), file: loc.file, line: loc.line + 1, column: loc.column + 1 });
+      }
+    }
+  }
+  // Source-locator dev plugins (react-dev-inspector, locatorjs, code-inspector)
+  // write the location straight onto the element.
+  const hints = {};
+  for (let node = el; node && Object.keys(hints).length === 0; node = node.parentElement) {
+    for (const attr of Array.from(node.attributes || [])) {
+      if (/^data-(inspector|source|loc|locatorjs|component-file|insp-path|v-inspector)/i.test(attr.name)) {
+        hints[attr.name] = String(attr.value).slice(0, 300);
+      }
+    }
+  }
+  return {
+    tag: el.tagName.toLowerCase(),
+    ref: globalThis.__evoflux ? __evoflux.ref(el) : null,
+    text: String(el.innerText || el.textContent || "").trim().slice(0, 200),
+    attributes,
+    box: {
+      x: Math.round(rect.x), y: Math.round(rect.y),
+      width: Math.round(rect.width), height: Math.round(rect.height),
+    },
+    styles: pick(style, properties),
+    framework,
+    components,
+    source_hints: hints,
+  };
+}
+
+async function cmdInspect(params) {
+  const tab = await resolveTab(params);
+  const spec = targetSpec(params);
+  if (!spec) throw new Error("inspect requires a ref or selector");
+  await ensureRuntime(tab.id);
+  const properties = Array.isArray(params?.properties) && params.properties.length
+    ? params.properties.slice(0, 60).map(String)
+    : DEFAULT_INSPECT_STYLES;
+  const data = await evalInPage(
+    tab.id,
+    `(() => { const el = ${elementExpr(spec)}; if (!el) return null;
+      return (${inspectInPage.toString()})(el, ${JSON.stringify(properties)}); })()`,
+  );
+  if (!data) throw new Error(`No element for ${describeSpec(spec)}`);
+  return { success: true, ...data };
+}
+
+// ── File upload ──────────────────────────────────────────────────────────────
+
+async function cmdUploadFile(params) {
+  const tab = await resolveTab(params);
+  const spec = targetSpec(params);
+  if (!spec) throw new Error("upload_file requires a ref or selector");
+  const files = Array.isArray(params?.files) ? params.files.map(String) : [];
+  if (!files.length) throw new Error("upload_file requires files");
+  await ensureDebuggerAttached(tab.id);
+  await ensureRuntime(tab.id);
+  const found = await cdpSend(tab.id, "Runtime.evaluate", {
+    expression: `(() => { const el = ${elementExpr(spec)};
+      return el && el.tagName === "INPUT" && el.type === "file" ? el : null; })()`,
+    returnByValue: false,
+  });
+  const objectId = found?.result?.objectId;
+  if (!objectId) throw new Error(`${describeSpec(spec)} is not an <input type="file">`);
+  try {
+    const multiple = await evalInPage(
+      tab.id, `(() => { const el = ${elementExpr(spec)}; return Boolean(el && el.multiple); })()`,
+    );
+    if (files.length > 1 && !multiple) throw new Error("This file input accepts a single file");
+    // Chrome reads the files itself and fires input/change like a user pick.
+    await cdpSend(tab.id, "DOM.setFileInputFiles", { files, objectId });
+  } finally {
+    cdpSend(tab.id, "Runtime.releaseObject", { objectId }, { showControl: false }).catch(() => {});
+  }
+  return { success: true, files: files.length };
+}
+
+// ── Emulation: network, CPU, location, time zone, locale ─────────────────────
+
+// Chrome DevTools' own throttling presets (bytes/s, ms).
+const NETWORK_PRESETS = {
+  none: { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 },
+  offline: { offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0 },
+  slow_3g: { offline: false, latency: 2000, downloadThroughput: 50000, uploadThroughput: 50000 },
+  fast_3g: { offline: false, latency: 562.5, downloadThroughput: 180000, uploadThroughput: 84375 },
+  fast_4g: { offline: false, latency: 60, downloadThroughput: 1125000, uploadThroughput: 187500 },
+};
+const tabEmulation = new Map();
+
+async function cmdEmulate(params) {
+  const tab = await resolveTab(params);
+  await ensureDebuggerAttached(tab.id);
+  const state = params?.clear ? {} : { ...(tabEmulation.get(tab.id) || {}) };
+  const send = (method, args = {}) => cdpSend(tab.id, method, args, { showControl: false });
+  const network = params?.clear ? "none" : params?.network;
+  if (network) {
+    const preset = NETWORK_PRESETS[network];
+    if (!preset) throw new Error(`Unknown network preset ${network}`);
+    await send("Network.enable");
+    await send("Network.emulateNetworkConditions", preset);
+    if (network === "none") delete state.network;
+    else state.network = network;
+  }
+  const cpu = params?.clear ? 1 : params?.cpu_throttling;
+  if (cpu != null) {
+    const rate = Math.max(1, Math.min(20, Number(cpu) || 1));
+    await send("Emulation.setCPUThrottlingRate", { rate });
+    if (rate === 1) delete state.cpu_throttling;
+    else state.cpu_throttling = rate;
+  }
+  if (params?.clear || params?.geolocation === null) {
+    await send("Emulation.clearGeolocationOverride");
+    delete state.geolocation;
+  } else if (params?.geolocation) {
+    const { latitude, longitude, accuracy = 50 } = params.geolocation;
+    await send("Emulation.setGeolocationOverride", { latitude, longitude, accuracy });
+    state.geolocation = { latitude, longitude, accuracy };
+  }
+  if (params?.clear || params?.timezone === "") {
+    await send("Emulation.setTimezoneOverride", { timezoneId: "" }).catch(() => ({}));
+    delete state.timezone;
+  } else if (params?.timezone) {
+    await send("Emulation.setTimezoneOverride", { timezoneId: String(params.timezone) });
+    state.timezone = String(params.timezone);
+  }
+  if (params?.clear || params?.locale === "") {
+    await send("Emulation.setLocaleOverride", {}).catch(() => ({}));
+    delete state.locale;
+  } else if (params?.locale) {
+    await send("Emulation.setLocaleOverride", { locale: String(params.locale) });
+    state.locale = String(params.locale);
+  }
+  if (Object.keys(state).length) tabEmulation.set(tab.id, state);
+  else tabEmulation.delete(tab.id);
+  return { success: true, emulation: state };
+}
+
+// ── Request mocking (Fetch interception) ─────────────────────────────────────
+
+const MAX_MOCK_RULES = 20;
+const tabMocks = new Map();
+let mockSeq = 0;
+
+function utf8ToBase64(text) {
+  const bytes = new TextEncoder().encode(String(text ?? ""));
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
+function publicMock(rule) {
+  const { body: _body, ...rest } = rule;
+  return { ...rest, body_chars: String(rule.body || "").length };
+}
+
+async function syncFetchInterception(tabId) {
+  const rules = tabMocks.get(tabId) || [];
+  if (!rules.length) {
+    tabMocks.delete(tabId);
+    await sendCommandOnce(tabId, "Fetch.disable", {}).catch(() => ({}));
+    return;
+  }
+  await sendCommandOnce(tabId, "Fetch.enable", {
+    patterns: rules.map((rule) => ({ urlPattern: rule.url_pattern, requestStage: "Request" })),
+  });
+}
+
+async function cmdMock(params) {
+  const tab = await resolveTab(params);
+  await ensureDebuggerAttached(tab.id);
+  const operation = String(params?.operation || "list");
+  const rules = tabMocks.get(tab.id) || [];
+  if (operation === "add") {
+    if (!params?.url_pattern) throw new Error("mock add needs a url_pattern");
+    if (rules.length >= MAX_MOCK_RULES) throw new Error(`At most ${MAX_MOCK_RULES} mock rules per tab`);
+    mockSeq += 1;
+    // `*` is a wildcard; a pattern without one is a prefix, so
+    // `http://localhost:8000/api/todos` also catches `?page=2`.
+    const pattern = String(params.url_pattern);
+    const rule = {
+      id: `m${mockSeq}`,
+      url_pattern: pattern.includes("*") ? pattern : `${pattern}*`,
+      method: params.method ? String(params.method).toUpperCase() : "",
+      status: Math.max(100, Math.min(599, Number(params.status) || 200)),
+      content_type: String(params.content_type || "application/json"),
+      headers: params.headers && typeof params.headers === "object" ? params.headers : {},
+      body: String(params.body ?? ""),
+      fail: params.fail ? String(params.fail) : "",
+      delay_ms: Math.max(0, Math.min(30000, Number(params.delay_ms) || 0)),
+      times: Math.max(0, Number(params.times) || 0),
+      hits: 0,
+    };
+    rules.push(rule);
+    tabMocks.set(tab.id, rules);
+    await syncFetchInterception(tab.id);
+    return { success: true, operation, rule: publicMock(rule), rules: rules.map(publicMock) };
+  }
+  if (operation === "remove") {
+    const next = rules.filter((rule) => rule.id !== String(params?.id || ""));
+    if (next.length === rules.length) throw new Error(`No mock rule ${params?.id}`);
+    tabMocks.set(tab.id, next);
+    await syncFetchInterception(tab.id);
+    return { success: true, operation, rules: next.map(publicMock) };
+  }
+  if (operation === "clear") {
+    tabMocks.set(tab.id, []);
+    await syncFetchInterception(tab.id);
+    return { success: true, operation, rules: [] };
+  }
+  return { success: true, operation: "list", rules: rules.map(publicMock) };
+}
+
+// Every paused request must be answered, or the page waits on it forever —
+// so anything unexpected continues it untouched.
+async function handleFetchPaused(tabId, params) {
+  const rules = tabMocks.get(tabId) || [];
+  const url = params.request?.url || "";
+  const method = String(params.request?.method || "GET").toUpperCase();
+  const rule = rules.find(
+    (candidate) =>
+      (!candidate.method || candidate.method === method) &&
+      urlMatchesPattern(url, candidate.url_pattern),
+  );
+  try {
+    if (!rule) {
+      await sendCommandOnce(tabId, "Fetch.continueRequest", { requestId: params.requestId });
+      return;
+    }
+    rule.hits += 1;
+    if (rule.times && rule.hits >= rule.times) {
+      tabMocks.set(tabId, rules.filter((candidate) => candidate !== rule));
+      syncFetchInterception(tabId).catch(() => {});
+    }
+    if (rule.delay_ms) await new Promise((resolve) => setTimeout(resolve, rule.delay_ms));
+    if (rule.fail) {
+      await sendCommandOnce(tabId, "Fetch.failRequest", { requestId: params.requestId, errorReason: rule.fail });
+      return;
+    }
+    const headers = [
+      { name: "Content-Type", value: rule.content_type },
+      { name: "Access-Control-Allow-Origin", value: "*" },
+      ...Object.entries(rule.headers).map(([name, value]) => ({ name, value: String(value) })),
+    ];
+    await sendCommandOnce(tabId, "Fetch.fulfillRequest", {
+      requestId: params.requestId,
+      responseCode: rule.status,
+      responseHeaders: headers,
+      body: utf8ToBase64(rule.body),
+    });
+  } catch (error) {
+    console.warn("[WebBridge] Mock failed; continuing request:", error.message);
+    await sendCommandOnce(tabId, "Fetch.continueRequest", { requestId: params.requestId }).catch(() => {});
+  }
+}
+
+// ── Performance: load timing, Web Vitals, runtime counters ───────────────────
+
+async function cmdPerformance(params) {
+  const tab = await resolveTab(params);
+  if (!browserOrigin(tab.url || "")) throw new Error("performance needs an http(s) page");
+  await ensureDebuggerAttached(tab.id);
+  const vitals = await evalInPage(
+    tab.id,
+    `(async () => {
+      const buffered = (type, extra = {}) => new Promise((resolve) => {
+        const entries = [];
+        try {
+          const po = new PerformanceObserver((list) => entries.push(...list.getEntries()));
+          po.observe({ type, buffered: true, ...extra });
+          setTimeout(() => { po.disconnect(); resolve(entries); }, 0);
+        } catch { resolve(entries); }
+      });
+      const nav = performance.getEntriesByType("navigation")[0];
+      const paint = Object.fromEntries(performance.getEntriesByType("paint").map((p) => [p.name, Math.round(p.startTime)]));
+      const lcp = (await buffered("largest-contentful-paint")).pop();
+      const shifts = (await buffered("layout-shift")).filter((s) => !s.hadRecentInput);
+      const events = await buffered("event", { durationThreshold: 16 });
+      const resources = performance.getEntriesByType("resource");
+      const round = (v) => (v == null ? null : Math.round(v));
+      return {
+        navigation: nav ? {
+          ttfb: round(nav.responseStart - nav.startTime),
+          dom_content_loaded: round(nav.domContentLoadedEventEnd - nav.startTime),
+          load: round(nav.loadEventEnd - nav.startTime),
+          transfer_size: nav.transferSize,
+          type: nav.type,
+        } : null,
+        first_paint: paint["first-paint"] ?? null,
+        first_contentful_paint: paint["first-contentful-paint"] ?? null,
+        largest_contentful_paint: lcp ? {
+          time: round(lcp.startTime),
+          element: lcp.element ? (lcp.element.tagName.toLowerCase() + (lcp.element.id ? "#" + lcp.element.id : "")) : "",
+          size: lcp.size,
+        } : null,
+        cumulative_layout_shift: Math.round(shifts.reduce((sum, s) => sum + s.value, 0) * 1000) / 1000,
+        slowest_interaction_ms: events.length ? round(Math.max(...events.map((e) => e.duration))) : null,
+        resources: {
+          count: resources.length,
+          transfer_size: resources.reduce((sum, r) => sum + (r.transferSize || 0), 0),
+          slowest: resources.slice().sort((a, b) => b.duration - a.duration).slice(0, 5)
+            .map((r) => ({ url: r.name.slice(0, 200), type: r.initiatorType, duration: round(r.duration), size: r.transferSize })),
+        },
+      };
+    })()`,
+    true,
+  );
+  let metrics = {};
+  try {
+    await cdpSend(tab.id, "Performance.enable", {}, { showControl: false });
+    const { metrics: list = [] } = await cdpSend(tab.id, "Performance.getMetrics", {}, { showControl: false });
+    const wanted = ["JSHeapUsedSize", "JSHeapTotalSize", "Nodes", "JSEventListeners", "LayoutCount", "RecalcStyleCount", "ScriptDuration", "TaskDuration"];
+    metrics = Object.fromEntries(list.filter((m) => wanted.includes(m.name)).map((m) => [m.name, m.value]));
+  } catch {
+    // Counters are a bonus; the page-side timings stand on their own.
+  }
+  if (vitals?.resources?.slowest) {
+    vitals.resources.slowest = vitals.resources.slowest.map((r) => ({ ...r, url: redactUrl(r.url) }));
+  }
+  return { success: true, page_url: redactUrl(tab.url || ""), ...vitals, metrics };
+}
+
 chrome.debugger.onEvent.addListener((source, method, params) => {
   const tabId = source.tabId;
   if (!tabId || !params) return;
   recordDevtoolsEvent(tabId, method, params);
+  if (method === "Fetch.requestPaused") {
+    handleFetchPaused(tabId, params);
+    return;
+  }
   const diagnostics = activeDiagnosticCapture(tabId);
   if (method === "Page.javascriptDialogOpening") {
     const history = pageDialogHistory.get(tabId) || [];
@@ -3463,6 +4009,9 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 chrome.debugger.onDetach.addListener((source) => {
   networkInflight.delete(source.tabId);
   diagnosticCaptures.delete(source.tabId);
+  // Emulation overrides die with the debugger session; mocks are re-armed
+  // on the next attach, since the agent still expects them.
+  tabEmulation.delete(source.tabId);
   activePageDialogs.delete(source.tabId);
   setAgentControlOverlay(source.tabId, false).catch(() => {});
   if (source.tabId && attachedTabs.delete(source.tabId)) {
@@ -3481,6 +4030,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   networkInflight.delete(tabId);
   diagnosticCaptures.delete(tabId);
   devtoolsLogs.delete(tabId);
+  tabEmulation.delete(tabId);
+  tabMocks.delete(tabId);
   activePageDialogs.delete(tabId);
   pageDialogHistory.delete(tabId);
   notifyAutomationState("tab_closed", tabId);
