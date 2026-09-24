@@ -2981,7 +2981,10 @@ async function collectIssueReport(tab) {
 const MAX_DEVTOOLS_CONSOLE = 300;
 const MAX_DEVTOOLS_NETWORK = 300;
 const MAX_DEVTOOLS_TEXT = 2000;
-const MAX_STACK_FRAMES = 6;
+// Frames kept per entry: enough to get past a framework's own frames (a React
+// warning is ten deep in react-dom before it reaches the component).
+const MAX_STACK_FRAMES = 20;
+const MAX_SHOWN_FRAMES = 8;
 const devtoolsLogs = new Map();
 const SECRET_KEYS =
   "authorization|proxy-authorization|cookie|set-cookie|password|passwd|access_token|refresh_token|id_token|token|secret|api[-_]?key|apikey|session|sig|signature";
@@ -3001,6 +3004,8 @@ function newDevtoolsLog() {
     // collected when source mapping is on (Coding sessions).
     source_maps: false,
     scripts: new Map(),
+    // Whether a document has loaded since recording began.
+    navigated: false,
   };
 }
 
@@ -3009,6 +3014,8 @@ async function enableDevtoolsDomains(tabId) {
     sendCommandOnce(tabId, "Runtime.enable", {}),
     sendCommandOnce(tabId, "Network.enable", {}),
     sendCommandOnce(tabId, "Log.enable", {}).catch(() => ({})),
+    // Layout/style/script counters only accumulate while this is enabled.
+    sendCommandOnce(tabId, "Performance.enable", {}).catch(() => ({})),
   ]);
   if (devtoolsLogs.get(tabId)?.source_maps) {
     // Debugger is only here for scriptParsed (which script has which map).
@@ -3167,15 +3174,17 @@ function sourceMapUrlFor(script) {
   }
 }
 
-// What a developer recognises: bundler namespaces stripped, a dev server's
-// module URL kept as is.
-function displaySource(source, mapUrl, sourceRoot) {
+// What a developer recognises: bundler namespaces stripped, a relative source
+// resolved against the map — or, for an inline map, against the script it is
+// inlined in (Vite serves `/src/App.tsx` with `sources: ["App.tsx"]`).
+function displaySource(source, mapUrl, sourceRoot, scriptUrl) {
   const name = `${sourceRoot || ""}${source}`;
   if (/^webpack:\/\//.test(name)) return name.replace(/^webpack:\/\/[^/]*\//, "");
   if (/^[a-z][a-z0-9+.-]*:/i.test(name)) return name;
-  if (mapUrl && !mapUrl.startsWith("data:")) {
+  const base = mapUrl && !mapUrl.startsWith("data:") ? mapUrl : scriptUrl;
+  if (base && /^https?:/i.test(base)) {
     try {
-      return new URL(name, mapUrl).href;
+      return new URL(name, base).href;
     } catch {
       return name;
     }
@@ -3183,7 +3192,7 @@ function displaySource(source, mapUrl, sourceRoot) {
   return name;
 }
 
-async function loadSourceMap(mapUrl) {
+async function loadSourceMap(mapUrl, scriptUrl = "") {
   if (sourceMapCache.has(mapUrl)) {
     const cached = sourceMapCache.get(mapUrl);
     sourceMapCache.delete(mapUrl);
@@ -3201,7 +3210,7 @@ async function loadSourceMap(mapUrl) {
       const map = JSON.parse(text.replace(/^\)\]\}'[^\n]*\n/, ""));
       if (!map || map.sections || !Array.isArray(map.sources)) return null;
       return {
-        sources: map.sources.map((source) => displaySource(source, mapUrl, map.sourceRoot)),
+        sources: map.sources.map((source) => displaySource(source, mapUrl, map.sourceRoot, scriptUrl)),
         lines: decodeMappings(map.mappings),
       };
     } catch {
@@ -3228,9 +3237,10 @@ function scriptFor(log, frame) {
 
 // The original position of a generated (0-based) frame, or null.
 async function mapFrame(log, frame) {
-  const mapUrl = sourceMapUrlFor(scriptFor(log, frame));
+  const script = scriptFor(log, frame);
+  const mapUrl = sourceMapUrlFor(script);
   if (!mapUrl) return null;
-  const map = await loadSourceMap(mapUrl);
+  const map = await loadSourceMap(mapUrl, script.url);
   const segments = map?.lines[frame.line];
   if (!segments?.length) return null;
   let found = null;
@@ -3248,24 +3258,85 @@ async function mapFrame(log, frame) {
   };
 }
 
-// Console entries as a read returns them: bookkeeping dropped and, where the
-// tab tracks source maps, positions moved from the bundle to the source.
+// Frames from libraries and dev-server plumbing rather than the app's code.
+const LIBRARY_FRAME =
+  /node_modules|\/\.vite\/deps\/|\/@vite\/|\/@react-refresh|chunk-[A-Z0-9]{6,}\.js|webpack\/bootstrap|^(node|internal):/i;
+
+function isLibraryFrame(frame) {
+  return LIBRARY_FRAME.test(frame.url || "");
+}
+
+// A stack as a developer reads one: the app's frames, with each run of
+// library frames folded into a single line. All-library stacks keep their top.
+function compactStack(frames) {
+  const lines = [];
+  let skipped = 0;
+  const fold = () => {
+    if (skipped) lines.push(`… ${skipped} library frame${skipped === 1 ? "" : "s"}`);
+    skipped = 0;
+  };
+  for (const frame of frames) {
+    if (lines.length >= MAX_SHOWN_FRAMES) break;
+    if (isLibraryFrame(frame)) {
+      skipped += 1;
+      continue;
+    }
+    fold();
+    lines.push(frameText(frame));
+  }
+  fold();
+  return lines;
+}
+
+// Console entries as a read returns them: bookkeeping dropped, positions
+// moved from the bundle to the source where the tab tracks source maps, and
+// the location taken from the first frame in the app's own code — a React
+// warning is raised inside react-dom, but the fix is in the component.
 async function presentConsoleEntries(log, entries) {
-  return Promise.all(entries.map(async ({ seq: _seq, frames, ...entry }) => {
-    if (!log.source_maps || !frames?.length) return entry;
-    const mapped = await Promise.all(frames.map((frame) => mapFrame(log, frame)));
-    if (!mapped.some(Boolean)) return entry;
-    const resolved = frames.map((frame, index) => mapped[index] || frame);
-    const top = resolved[0];
+  return Promise.all(entries.map(async ({ seq: _seq, frames, with_stack: withStack, ...entry }) => {
+    if (!frames?.length) return entry;
+    let resolved = frames;
+    let mapped = false;
+    if (log.source_maps) {
+      const results = await Promise.all(frames.map((frame) => mapFrame(log, frame)));
+      mapped = results.some(Boolean);
+      resolved = frames.map((frame, index) => results[index] || frame);
+    }
+    const own = resolved.find((frame) => !isLibraryFrame(frame));
+    const where = own || resolved[0];
     return {
       ...entry,
-      url: redactUrl(top.url),
-      line: top.line + 1,
-      column: top.column + 1,
-      stack: entry.stack ? resolved.map(frameText) : undefined,
-      source_mapped: true,
+      url: redactUrl(where.url),
+      line: where.line + 1,
+      column: where.column + 1,
+      // Raised entirely inside a library (React's own warnings are): the
+      // location is the library's, and the message names the component.
+      ...(own ? {} : { library: true }),
+      ...(withStack ? { stack: compactStack(resolved) } : {}),
+      ...(mapped ? { source_mapped: true } : {}),
     };
   }));
+}
+
+// console.log's own formatting: "%s items" with a second argument prints as
+// "3 items", not the template and the value side by side.
+function consoleArgsText(args) {
+  const list = args || [];
+  const first = list[0];
+  if (first?.type !== "string" || !/%[sdifoOc%]/.test(first.value || "")) {
+    return list.map(remoteObjectText).join(" ");
+  }
+  const rest = list.slice(1);
+  const head = String(first.value).replace(/%([sdifoOc%])/g, (match, spec) => {
+    if (spec === "%") return "%";
+    if (!rest.length) return match;
+    const arg = rest.shift();
+    if (spec === "c") return "";
+    if (spec === "d" || spec === "i") return String(parseInt(arg.value ?? arg.description, 10));
+    if (spec === "f") return String(parseFloat(arg.value ?? arg.description));
+    return remoteObjectText(arg);
+  });
+  return [head, ...rest.map(remoteObjectText)].join(" ");
 }
 
 // A console argument as DevTools would print it, from the RemoteObject CDP
@@ -3342,6 +3413,24 @@ function recordDevtoolsEvent(tabId, method, params) {
     }
     log.page_seq = first;
     log.page_url = params.frame.url || "";
+    // A document loaded while recording: its load is in the log.
+    log.navigated = true;
+    // The old document keeps requesting until the new one commits, and its
+    // unfinished requests never report an end. They belong to the page that
+    // left, not to this one, and are no longer "in flight".
+    for (const entry of log.network.values()) {
+      if (
+        !entry.done &&
+        entry.frame_id === params.frame.id &&
+        entry.loader_id &&
+        entry.loader_id !== params.frame.loaderId
+      ) {
+        entry.done = true;
+        entry.canceled = true;
+        entry.error = "abandoned: the page navigated away";
+        entry.stale = true;
+      }
+    }
   } else if (method === "Runtime.consoleAPICalled") {
     if (params.type === "endGroup") return;
     const top = params.stackTrace?.callFrames?.[0];
@@ -3351,10 +3440,9 @@ function recordDevtoolsEvent(tabId, method, params) {
     pushConsole(log, {
       source: "console",
       level,
-      text: redactSecrets((params.args || []).map(remoteObjectText).join(" ")),
+      text: redactSecrets(consoleArgsText(params.args)),
       ...(top ? { url: redactUrl(top.url || ""), line: top.lineNumber + 1, column: top.columnNumber + 1 } : {}),
-      ...(withStack ? { stack: frames.map(frameText) } : {}),
-      ...(frames.length ? { frames: withStack ? frames : frames.slice(0, 1) } : {}),
+      ...(frames.length ? { frames: withStack ? frames : frames.slice(0, 1), with_stack: withStack } : {}),
     });
   } else if (method === "Runtime.exceptionThrown") {
     const details = params.exceptionDetails || {};
@@ -3374,8 +3462,7 @@ function recordDevtoolsEvent(tabId, method, params) {
       level: "error",
       text: redactSecrets(frames.length ? messageOnly(description) : description),
       ...(details.url ? { url: redactUrl(details.url), line: details.lineNumber + 1, column: details.columnNumber + 1 } : {}),
-      stack: frames.map(frameText),
-      ...(frames.length ? { frames } : {}),
+      ...(frames.length ? { frames, with_stack: true } : {}),
     });
   } else if (method === "Debugger.scriptParsed") {
     if (!log.source_maps || !params.sourceMapURL) return;
@@ -3411,7 +3498,8 @@ function recordDevtoolsEvent(tabId, method, params) {
       url: redactUrl(params.request?.url || ""),
       type: String(params.type || "Other"),
       initiator: params.initiator?.type || "",
-      ...(params.type === "Document" && params.loaderId ? { loader_id: params.loaderId } : {}),
+      ...(params.loaderId ? { loader_id: params.loaderId } : {}),
+      ...(params.frameId ? { frame_id: params.frameId } : {}),
       started_at: Date.now(),
       wall: params.timestamp,
       done: false,
@@ -3446,25 +3534,27 @@ function recordDevtoolsEvent(tabId, method, params) {
 }
 
 function inDevtoolsScope(log, entry, scope) {
-  return scope === "all" || entry.seq > log.page_seq;
+  if (scope === "all") return true;
+  return !entry.stale && entry.seq > log.page_seq;
 }
 
 function publicNetworkEntry(entry) {
-  const { wall: _wall, seq: _seq, loader_id: _loader, ...rest } = entry;
+  const {
+    wall: _wall, seq: _seq, loader_id: _loader, frame_id: _frame, stale: _stale, ...rest
+  } = entry;
   return rest;
 }
 
-// Recording that began a moment ago — by this read, or by the Coding
-// session's first command just before it — has not seen the page load.
-const DEVTOOLS_FRESH_MS = 1500;
-
+// Until a document has loaded while recording, the current page's load —
+// often where its errors are — is not in the log, however the recording was
+// started (by this read, or by a Coding session's first command).
 async function devtoolsLogFor(params) {
   const tab = await resolveTab(params);
   const startedNow = await startDevtoolsLog(tab, {
     sourceMaps: params?._webbridge_devtools === "capture",
   });
   const log = devtoolsLogs.get(tab.id);
-  return { tab, log, startedNow: startedNow || Date.now() - log.started_at < DEVTOOLS_FRESH_MS };
+  return { tab, log, startedNow: startedNow || !log.navigated };
 }
 
 async function cmdConsole(params) {
@@ -3777,11 +3867,15 @@ function inspectInPage(el, properties) {
         const at = src
           ? { file: src.fileName, line: src.lineNumber, column: src.columnNumber }
           : fiber._debugStack ? frame(fiber._debugStack.stack) : null;
-        components.push({ name, ...(at || {}) });
+        // React records where the element was created (the JSX in the
+        // parent), not where the component is defined.
+        components.push({ name, ...(at ? { ...at, site: "jsx" } : {}) });
       }
       fiber = fiber.return;
     }
-    if (rendered && components.length && !components[0].file) Object.assign(components[0], rendered);
+    if (rendered && components.length && !components[0].file) {
+      Object.assign(components[0], rendered, { site: "jsx" });
+    }
   } else if (el.__vueParentComponent || el.closest?.("[data-v-app]")) {
     framework = "vue";
     let instance = el.__vueParentComponent;

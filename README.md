@@ -85,7 +85,13 @@ Chrome DevTools Protocol (`chrome.debugger`):
   collect `scriptParsed` source-map URLs. Console/exception frames and React 19
   owner-stack locations are then mapped (v3 maps, inline or fetched with a 3 s
   timeout and 15 MB cap, 24 cached) to the original sources and flagged
-  `source_mapped`. Index maps with `sections` are not mapped.
+  `source_mapped`. Index maps with `sections` are not mapped. Up to 20 frames
+  are kept per entry; a read reports the first app frame as the location,
+  folds library frames (`node_modules`, Vite deps/client) into one line, and
+  flags `library` when every frame is library code. Console text applies
+  `%s/%d/%i/%f/%o/%O/%c` like DevTools. Requests the previous document left
+  unfinished when the main frame navigates are marked abandoned and leave the
+  current page's scope.
 
 Screenshots are captured at CSS-pixel scale (`clip.scale = 1`), so a click at
 the x,y a model reads off the image lands correctly even on HiDPI/Retina
