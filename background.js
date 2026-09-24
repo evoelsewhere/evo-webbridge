@@ -76,6 +76,9 @@ let automationStateBroadcastTimer = null;
 const agentControlOverlays = new Set();
 const overlayCaptureSuspensions = new Map();
 const agentPointerPositions = new Map();
+// tabId -> "instant" when the session driving it asked for no pointer glide
+// (EvoFlux Coding sessions). Absent means the human-paced default.
+const agentPointerMotion = new Map();
 const activePageDialogs = new Map();
 const pageDialogHistory = new Map();
 
@@ -1667,7 +1670,30 @@ function commandTimeoutMs(params) {
   return Math.max(100, Math.min(MAX_COMMAND_TIMEOUT_MS, value));
 }
 
+// Two spellings of one address. Chrome canonicalises what it is given —
+// `http://localhost:3000` is reported as `http://localhost:3000/`, a host is
+// lower-cased, a default port dropped — so the URL a tab reports is often not
+// the string the agent sent.
+function sameUrl(a, b) {
+  try {
+    return new URL(String(a)).href === new URL(String(b)).href;
+  } catch {
+    return String(a || "") === String(b || "");
+  }
+}
+
+function withoutHash(url) {
+  try {
+    const parsed = new URL(String(url));
+    parsed.hash = "";
+    return parsed.href;
+  } catch {
+    return String(url || "");
+  }
+}
+
 function urlMatchesPattern(url, pattern) {
+  if (!String(pattern).includes("*")) return sameUrl(url, pattern);
   const escaped = String(pattern).replace(/[.+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`^${escaped.replace(/\*/g, ".*")}$`).test(String(url || ""));
 }
@@ -1706,12 +1732,27 @@ async function cmdBatch(params) {
   if (!commands.length) throw new Error("batch requires commands");
   if (commands.length > 25) throw new Error("batch takes at most 25 commands");
   const stopOnError = params?.stop_on_error !== false;
+  // The backend pins a bound session's tab (and its origin) on the batch
+  // itself. A step that names no tab of its own acts on that one — otherwise
+  // it would fall through to whatever tab is active, outside the binding.
+  const inherited = {};
+  if (params?.tab_id != null) {
+    inherited.tab_id = params.tab_id;
+    if (params._webbridge_expected_origin) {
+      inherited._webbridge_expected_origin = params._webbridge_expected_origin;
+    }
+  }
   const results = [];
   for (const [index, command] of commands.entries()) {
     const name = command && command.action;
     if (name === "batch") throw new Error("batch cannot contain a batch");
+    const own = { ...(command.params || {}) };
+    const stepParams = own.tab_id != null ? own : { ...inherited, ...own };
+    if (params?._webbridge_pointer_motion) {
+      stepParams._webbridge_pointer_motion = params._webbridge_pointer_motion;
+    }
     try {
-      const data = await runCommand(name, { ...(command.params || {}) });
+      const data = await runCommand(name, stepParams);
       results.push({ action: name, success: true, data });
     } catch (error) {
       results.push({ action: name, success: false, error: error.message });
@@ -2392,6 +2433,11 @@ async function resolveTab(params) {
   if (await humanLeaseForTab(tab)) {
     throw new Error("Human control is active for this tab. Wait for the user to resume the agent.");
   }
+  if (params?._webbridge_pointer_motion === "instant") {
+    agentPointerMotion.set(tab.id, "instant");
+  } else if (params?._webbridge_pointer_motion) {
+    agentPointerMotion.delete(tab.id);
+  }
   if (
     params?._webbridge_expected_origin &&
     browserOrigin(tab.url || tab.pendingUrl || "") !== params._webbridge_expected_origin
@@ -2636,7 +2682,10 @@ async function sendCommandResilient(tabId, method, params, attachOptions = {}) {
 
 async function dispatchHumanPointerMove(tabId, target, eventParams = {}) {
   const from = agentPointerPositions.get(tabId);
-  const points = from
+  // The glide is there so a person watching can follow the agent. With
+  // "instant" motion one mouseMoved still lands on the target (hover state,
+  // the overlay cursor), without the 72–360 ms path and its per-step messages.
+  const points = from && agentPointerMotion.get(tabId) !== "instant"
     ? humanPointerPath(from, target)
     : [{ x: target.x, y: target.y, delayMs: 0 }];
   let result;
@@ -2974,6 +3023,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   agentControlOverlays.delete(tabId);
   overlayCaptureSuspensions.delete(tabId);
   agentPointerPositions.delete(tabId);
+  agentPointerMotion.delete(tabId);
   networkInflight.delete(tabId);
   diagnosticCaptures.delete(tabId);
   activePageDialogs.delete(tabId);
@@ -3002,49 +3052,116 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 // ── Command implementations ──────────────────────────────────────────────────
 
+// Longest a page-loading command waits for "complete" before reporting
+// timed_out. Kept under the backend's 45 s navigate budget so a page that
+// never finishes (long-polling, a stalled asset) still returns where it is
+// instead of the call failing with no answer.
+const NAVIGATION_LOAD_TIMEOUT_MS = 30000;
+const HISTORY_STEP_TIMEOUT_MS = 10000;
+
+// Resolves true when the tab finishes loading a document, false on timeout
+// or cancel. Register it before starting the navigation so the event cannot
+// be missed.
+function waitForTabComplete(tabId, timeoutMs) {
+  let cancel = () => {};
+  const done = new Promise((resolve) => {
+    let timer = null;
+    const listener = (id, changeInfo) => {
+      if (id === tabId && changeInfo.status === "complete") finish(true);
+    };
+    const finish = (value) => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      clearTimeout(timer);
+      resolve(value);
+    };
+    cancel = () => finish(false);
+    timer = setTimeout(() => finish(false), timeoutMs);
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+  return { done, cancel };
+}
+
+// The page a navigation actually reached: its address after any redirect
+// (server or client-side router), its title, and whether the load finished.
+async function landedPage(tabId, requestedUrl, loaded) {
+  let current = await chrome.tabs.get(tabId);
+  let url = current.url || current.pendingUrl || requestedUrl || "";
+  if (browserOrigin(url)) {
+    await waitForDomSettled(tabId);
+    await ensureDebuggerAttached(tabId);
+    current = await chrome.tabs.get(tabId);
+    try {
+      url = (await evalInPage(tabId, "location.href")) || current.url || url;
+    } catch {
+      url = current.url || url;
+    }
+  }
+  await broadcastTabInfo();
+  return {
+    success: true,
+    url,
+    title: current.title || "",
+    ...(requestedUrl ? { redirected: !sameUrl(url, requestedUrl) } : {}),
+    timed_out: !loaded,
+  };
+}
+
 async function cmdNavigate(params) {
   const tab = await resolveTab(params);
-  let timeoutId = null;
-  let listener = null;
-  const completed = new Promise((resolve) => {
-    listener = (tabId, changeInfo) => {
-      if (tabId === tab.id && changeInfo.status === "complete") {
-        chrome.tabs.onUpdated.removeListener(listener);
-        if (timeoutId) clearTimeout(timeoutId);
-        resolve(true);
-      }
-    };
-    chrome.tabs.onUpdated.addListener(listener);
-    timeoutId = setTimeout(() => {
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve(false);
-    }, commandTimeoutMs(params));
-  });
-
+  const before = tab.url || "";
+  // Only the #fragment changing is a same-document navigation: it never
+  // fires "complete", so there is no load to wait for.
+  const sameDocument =
+    withoutHash(before) === withoutHash(params.url) && !sameUrl(before, params.url);
+  const load = waitForTabComplete(
+    tab.id,
+    Math.min(commandTimeoutMs(params), NAVIGATION_LOAD_TIMEOUT_MS),
+  );
   try {
     await chrome.tabs.update(tab.id, { url: params.url });
   } catch (e) {
-    if (listener) chrome.tabs.onUpdated.removeListener(listener);
-    if (timeoutId) clearTimeout(timeoutId);
+    load.cancel();
     throw e;
   }
-  const loaded = await completed;
-  const route = await cmdWaitForUrl({
-    ...params,
-    url: params.url,
-    timeout_ms: commandTimeoutMs(params),
+  if (sameDocument) load.cancel();
+  const loaded = sameDocument ? true : await load.done;
+  return landedPage(tab.id, params.url, loaded);
+}
+
+// back/forward land either on a loaded document or, for an entry an SPA
+// router pushed, on a new address with nothing loaded at all. Either way the
+// tab ends idle on a different URL — or fires "complete" if the entry had the
+// same address.
+async function historyStep(params, step) {
+  const tab = await resolveTab(params);
+  await ensureDebuggerAttached(tab.id);
+  const before = tab.url || "";
+  const timeoutMs = Math.min(commandTimeoutMs(params), HISTORY_STEP_TIMEOUT_MS);
+  const load = waitForTabComplete(tab.id, timeoutMs);
+  let completed = false;
+  load.done.then((value) => {
+    completed = value;
   });
-  await waitForDomSettled(tab.id);
-  await broadcastTabInfo();
-  const current = await chrome.tabs.get(tab.id);
-  if (browserOrigin(current.url || current.pendingUrl || "")) {
-    await ensureDebuggerAttached(current.id);
+  try {
+    await step(tab.id);
+    const deadline = Date.now() + timeoutMs;
+    let loaded = false;
+    while (Date.now() < deadline) {
+      if (completed) {
+        loaded = true;
+        break;
+      }
+      const current = await chrome.tabs.get(tab.id);
+      if (current.status === "complete" && (current.url || "") !== before) {
+        loaded = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return landedPage(tab.id, null, loaded);
+  } finally {
+    load.cancel();
   }
-  return {
-    success: true,
-    url: route.url || current.url || current.pendingUrl || params.url,
-    timed_out: !loaded,
-  };
 }
 
 async function cmdClick(params) {
@@ -3624,27 +3741,27 @@ async function cmdEvaluate(params) {
 }
 
 async function cmdBack(params) {
-  const tab = await resolveTab(params);
-  await ensureDebuggerAttached(tab.id);
-  await chrome.tabs.goBack(tab.id);
-  await broadcastTabInfo();
-  return { success: true };
+  return historyStep(params, (tabId) => chrome.tabs.goBack(tabId));
 }
 
 async function cmdForward(params) {
-  const tab = await resolveTab(params);
-  await ensureDebuggerAttached(tab.id);
-  await chrome.tabs.goForward(tab.id);
-  await broadcastTabInfo();
-  return { success: true };
+  return historyStep(params, (tabId) => chrome.tabs.goForward(tabId));
 }
 
 async function cmdReload(params) {
   const tab = await resolveTab(params);
   await ensureDebuggerAttached(tab.id);
-  await chrome.tabs.reload(tab.id);
-  await broadcastTabInfo();
-  return { success: true };
+  const load = waitForTabComplete(
+    tab.id,
+    Math.min(commandTimeoutMs(params), NAVIGATION_LOAD_TIMEOUT_MS),
+  );
+  try {
+    await chrome.tabs.reload(tab.id);
+  } catch (e) {
+    load.cancel();
+    throw e;
+  }
+  return landedPage(tab.id, null, await load.done);
 }
 
 // ── Wait / element-based actions ─────────────────────────────────────────────

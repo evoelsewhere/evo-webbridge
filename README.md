@@ -13,7 +13,12 @@ The extension opens a persistent WebSocket to the EvoFlux backend relay
 Chrome DevTools Protocol (`chrome.debugger`):
 
 - **Navigation/tabs** — navigate, back, forward, reload, get_tabs, switch_tab,
-  open_tab, close_tab.
+  open_tab, close_tab. navigate/back/forward/reload wait for the page (up to
+  30 s for a load, 10 s for a history step) and return the URL it landed on,
+  its title and `timed_out`; navigate also reports `redirected`. URLs are
+  compared in canonical form, so `http://localhost:3000` matches the
+  `http://localhost:3000/` Chrome reports, and a hash-only navigation or an
+  SPA history entry returns without waiting for a load that never comes.
 - **Element-based (preferred)** — snapshot, click_selector, click_text, hover,
   focus, fill, select_option, set_checked, drag, and drag_to_point. `drag` uses
   real CDP mouse actions by default, including the press delay and movement
@@ -107,6 +112,13 @@ or intercepting user input. The overlay disappears when control is released,
 the user takes a human-control lease, the relay disconnects, or the debugger is
 detached; it restores after same-tab navigation while agent control remains
 active. Reduced-motion browser preferences disable non-essential animation.
+
+By default the pointer glides to each target along a short human-paced path
+(72–360 ms) so a person can follow it. A command carrying
+`_webbridge_pointer_motion: "instant"` — EvoFlux sends it for Coding sessions —
+switches that tab to a single `mouseMoved` at the target; `"human"` switches it
+back. A `batch` passes its `tab_id`, origin pin and pointer motion to every
+step that names no tab of its own.
 
 Connection attempts are generation-scoped, so Disconnect and connection-address
 changes supersede an in-flight ticket/bootstrap request instead of allowing a
