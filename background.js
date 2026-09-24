@@ -91,11 +91,14 @@ const COMMAND_CAPABILITIES = [
   "snapshot", "semantic_snapshot", "semantic_read", "semantic_select",
   "semantic_write", "extract_elements", "scroll_to_bottom", "resize",
   "reset_viewport", "dialogs", "handle_dialog", "status", "batch",
+  "console", "network", "network_body", "debug_summary",
 ];
 
 // Bumped when the agent-facing behaviour of the commands changes, so the
 // caller can tell a browser that speaks refs from one that does not.
-const COMMAND_FEATURES = ["refs", "shadow_dom", "same_origin_frames", "batch", "diff_snapshot"];
+const COMMAND_FEATURES = [
+  "refs", "shadow_dom", "same_origin_frames", "batch", "diff_snapshot", "devtools_log",
+];
 
 // ── Config (persisted in chrome.storage.local, edited in Side Chat settings) ─
 
@@ -1748,8 +1751,8 @@ async function cmdBatch(params) {
     if (name === "batch") throw new Error("batch cannot contain a batch");
     const own = { ...(command.params || {}) };
     const stepParams = own.tab_id != null ? own : { ...inherited, ...own };
-    if (params?._webbridge_pointer_motion) {
-      stepParams._webbridge_pointer_motion = params._webbridge_pointer_motion;
+    for (const key of ["_webbridge_pointer_motion", "_webbridge_devtools"]) {
+      if (params?.[key]) stepParams[key] = params[key];
     }
     try {
       const data = await runCommand(name, stepParams);
@@ -1831,6 +1834,18 @@ async function runCommand(action, params) {
         break;
       case "handle_dialog":
         result = await cmdHandleDialog(params);
+        break;
+      case "console":
+        result = await cmdConsole(params);
+        break;
+      case "network":
+        result = await cmdNetwork(params);
+        break;
+      case "network_body":
+        result = await cmdNetworkBody(params);
+        break;
+      case "debug_summary":
+        result = await cmdDebugSummary(params);
         break;
       case "screenshot":
         result = await cmdScreenshot(params);
@@ -2444,6 +2459,17 @@ async function resolveTab(params) {
   ) {
     throw new Error("Bound browser tab changed origin; bind this tab again before continuing.");
   }
+  // A Coding session records console and network from its first command, so
+  // the load it is about to trigger is already in the log when it asks.
+  if (
+    params?._webbridge_devtools === "capture" &&
+    !devtoolsLogs.has(tab.id) &&
+    browserOrigin(tab.url || tab.pendingUrl || "")
+  ) {
+    await startDevtoolsLog(tab).catch((error) => {
+      console.warn("[WebBridge] Devtools log unavailable:", error.message);
+    });
+  }
   return tab;
 }
 
@@ -2629,6 +2655,9 @@ async function ensureDebuggerAttached(tabId, { showControl = true } = {}) {
   await sendCommandOnce(tabId, "Page.enable", {}).catch((error) => {
     console.warn("[WebBridge] Page dialog events unavailable:", error.message);
   });
+  // A re-attach (after a detach Chrome did on its own) must keep feeding a
+  // devtools log the agent is already reading.
+  if (devtoolsLogs.has(tabId)) await enableDevtoolsDomains(tabId);
   if (showControl) {
     await setAgentControlOverlay(tabId, true);
     notifyAutomationState("browser_control", tabId);
@@ -2911,9 +2940,434 @@ async function collectIssueReport(tab) {
   return { capture, diagnostics: entries };
 }
 
+// ── Devtools log (agent-readable console / errors / network) ────────────────
+//
+// The issue capture above is the user's: opt-in, 30 redacted warnings, sent
+// only when they press Report. This is the agent's view of the same CDP
+// events while it debugs a page — every console level with its source
+// location, uncaught exceptions with their stack, and each request with its
+// status, type and timing. It starts on the first console/network read, or
+// with the first command of an EvoFlux Coding session, and keeps running
+// across navigations so an error just before a redirect is not lost.
+//
+// It is not started unasked: Runtime.enable is observable to page scripts,
+// and the real sites a Work session drives include ones that treat an
+// attached debugger as a bot.
+
+const MAX_DEVTOOLS_CONSOLE = 300;
+const MAX_DEVTOOLS_NETWORK = 300;
+const MAX_DEVTOOLS_TEXT = 2000;
+const MAX_STACK_FRAMES = 6;
+const devtoolsLogs = new Map();
+const SECRET_KEYS =
+  "authorization|proxy-authorization|cookie|set-cookie|password|passwd|access_token|refresh_token|id_token|token|secret|api[-_]?key|apikey|session|sig|signature";
+
+function newDevtoolsLog() {
+  return {
+    started_at: Date.now(),
+    seq: 0,
+    page_seq: 0,
+    page_url: "",
+    console: [],
+    console_dropped: 0,
+    network: new Map(),
+    network_dropped: 0,
+    redirects: 0,
+  };
+}
+
+async function enableDevtoolsDomains(tabId) {
+  await Promise.all([
+    sendCommandOnce(tabId, "Runtime.enable", {}),
+    sendCommandOnce(tabId, "Network.enable", {}),
+    sendCommandOnce(tabId, "Log.enable", {}).catch(() => ({})),
+  ]);
+}
+
+// Start the tab's devtools log if it is not running. Returns true when it
+// was started by this call — nothing from before this moment was recorded.
+async function startDevtoolsLog(tab) {
+  if (devtoolsLogs.has(tab.id)) return false;
+  if (!browserOrigin(tab.url || tab.pendingUrl || "")) {
+    throw new Error("Console and network are only recorded on http(s) pages.");
+  }
+  const log = newDevtoolsLog();
+  log.page_url = tab.url || tab.pendingUrl || "";
+  devtoolsLogs.set(tab.id, log);
+  try {
+    await ensureDebuggerAttached(tab.id, { showControl: false });
+    await enableDevtoolsDomains(tab.id);
+  } catch (error) {
+    devtoolsLogs.delete(tab.id);
+    throw error;
+  }
+  return true;
+}
+
+// Secrets out, everything a developer needs to debug in. Unlike the issue
+// capture this keeps paths, query parameter names and long identifiers
+// (bundle hashes, request ids) — only credential-shaped values go.
+function redactSecrets(value) {
+  let text = String(value ?? "").slice(0, MAX_DEVTOOLS_TEXT * 2);
+  text = text.replace(
+    new RegExp(`(["'])(${SECRET_KEYS})\\1\\s*:\\s*(["'])[^"'\\r\\n]*\\3`, "gi"),
+    (_match, keyQuote, key, valueQuote) => `${keyQuote}${key}${keyQuote}:${valueQuote}[REDACTED]${valueQuote}`,
+  );
+  text = text.replace(/\b(cookie|set-cookie)\b\s*["']?\s*[:=]\s*[^\r\n]*/gi, "$1=[REDACTED]");
+  text = text.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]");
+  text = text.replace(/\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED]");
+  text = text.replace(/https?:\/\/[^\s"'<>)]+/gi, (url) => redactUrl(url));
+  return text.length > MAX_DEVTOOLS_TEXT ? `${text.slice(0, MAX_DEVTOOLS_TEXT - 1)}…` : text;
+}
+
+function redactUrl(url) {
+  try {
+    const parsed = new URL(url);
+    parsed.username = "";
+    parsed.password = "";
+    const secret = new RegExp(`^(${SECRET_KEYS})$`, "i");
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (secret.test(key)) parsed.searchParams.set(key, "[REDACTED]");
+    }
+    return parsed.href;
+  } catch {
+    return String(url || "");
+  }
+}
+
+function stackFrames(stackTrace) {
+  const frames = stackTrace?.callFrames || [];
+  return frames.slice(0, MAX_STACK_FRAMES).map((frame) => {
+    const where = `${redactUrl(frame.url || "")}:${Number(frame.lineNumber) + 1}:${Number(frame.columnNumber) + 1}`;
+    return frame.functionName ? `${frame.functionName} (${where})` : where;
+  });
+}
+
+// A console argument as DevTools would print it, from the RemoteObject CDP
+// sends: primitives as values, objects from their property preview.
+function remoteObjectText(arg) {
+  if (!arg) return "";
+  if (arg.type === "string") return String(arg.value ?? "");
+  if (arg.unserializableValue) return String(arg.unserializableValue);
+  if (Object.prototype.hasOwnProperty.call(arg, "value")) {
+    try {
+      return JSON.stringify(arg.value) ?? String(arg.value);
+    } catch {
+      return String(arg.value);
+    }
+  }
+  const preview = arg.preview;
+  if (preview && Array.isArray(preview.properties) && arg.subtype !== "error") {
+    const tail = preview.overflow ? ", …" : "";
+    if (preview.subtype === "array") {
+      return `[${preview.properties.map((p) => p.value ?? p.type).join(", ")}${tail}]`;
+    }
+    const body = preview.properties
+      .map((p) => `${p.name}: ${p.type === "string" ? JSON.stringify(p.value ?? "") : p.value ?? p.type}`)
+      .join(", ");
+    const name = preview.description && preview.description !== "Object" ? `${preview.description} ` : "";
+    return `${name}{${body}${tail}}`;
+  }
+  return String(arg.description || arg.type || "");
+}
+
+const CONSOLE_LEVELS = { debug: 0, log: 1, info: 1, warning: 2, error: 3 };
+
+function consoleLevel(type) {
+  const value = String(type || "log").toLowerCase();
+  if (value === "warning" || value === "warn") return "warning";
+  if (value === "error" || value === "assert") return "error";
+  if (value === "debug" || value === "verbose" || value === "trace") return "debug";
+  if (value === "info") return "info";
+  return "log";
+}
+
+function pushConsole(log, entry) {
+  log.seq += 1;
+  log.console.push({ seq: log.seq, ts: Date.now(), page_url: log.page_url, ...entry });
+  if (log.console.length > MAX_DEVTOOLS_CONSOLE) {
+    const excess = log.console.length - MAX_DEVTOOLS_CONSOLE;
+    log.console.splice(0, excess);
+    log.console_dropped += excess;
+  }
+}
+
+function pushNetwork(log, id, entry) {
+  log.seq += 1;
+  log.network.set(id, { seq: log.seq, page_url: log.page_url, ...entry });
+  if (log.network.size > MAX_DEVTOOLS_NETWORK) {
+    const oldest = log.network.keys().next().value;
+    log.network.delete(oldest);
+    log.network_dropped += 1;
+  }
+}
+
+function recordDevtoolsEvent(tabId, method, params) {
+  const log = devtoolsLogs.get(tabId);
+  if (!log) return;
+  if (method === "Page.frameNavigated") {
+    if (!params.frame || params.frame.parentId) return;
+    // The page begins with the request for its document, sent (and maybe
+    // redirected) before the frame commits — not at the commit itself.
+    let first = log.seq;
+    for (const entry of log.network.values()) {
+      if (entry.loader_id && entry.loader_id === params.frame.loaderId) {
+        first = Math.min(first, entry.seq - 1);
+      }
+    }
+    log.page_seq = first;
+    log.page_url = params.frame.url || "";
+  } else if (method === "Runtime.consoleAPICalled") {
+    if (params.type === "endGroup") return;
+    const top = params.stackTrace?.callFrames?.[0];
+    const level = consoleLevel(params.type);
+    pushConsole(log, {
+      source: "console",
+      level,
+      text: redactSecrets((params.args || []).map(remoteObjectText).join(" ")),
+      ...(top ? { url: redactUrl(top.url || ""), line: top.lineNumber + 1, column: top.columnNumber + 1 } : {}),
+      ...(level === "error" || level === "warning" ? { stack: stackFrames(params.stackTrace) } : {}),
+    });
+  } else if (method === "Runtime.exceptionThrown") {
+    const details = params.exceptionDetails || {};
+    pushConsole(log, {
+      source: "exception",
+      level: "error",
+      text: redactSecrets(details.exception?.description || details.text || "Uncaught exception"),
+      ...(details.url ? { url: redactUrl(details.url), line: details.lineNumber + 1, column: details.columnNumber + 1 } : {}),
+      stack: stackFrames(details.stackTrace),
+    });
+  } else if (method === "Log.entryAdded") {
+    const entry = params.entry || {};
+    pushConsole(log, {
+      source: `browser:${entry.source || "other"}`,
+      level: consoleLevel(entry.level),
+      text: redactSecrets(entry.text || ""),
+      ...(entry.url ? { url: redactUrl(entry.url), ...(entry.lineNumber != null ? { line: entry.lineNumber + 1 } : {}) } : {}),
+    });
+  } else if (method === "Network.requestWillBeSent") {
+    const id = params.requestId;
+    const previous = log.network.get(id);
+    if (previous && params.redirectResponse) {
+      // One requestId carries the whole redirect chain; keep each hop.
+      log.network.delete(id);
+      log.redirects += 1;
+      log.network.set(`${id}~${log.redirects}`, {
+        ...previous,
+        status: params.redirectResponse.status,
+        status_text: params.redirectResponse.statusText || "",
+        redirected_to: redactUrl(params.request?.url || ""),
+        done: true,
+        duration_ms: previous.wall ? Math.round((params.timestamp - previous.wall) * 1000) : undefined,
+      });
+    }
+    pushNetwork(log, id, {
+      request_id: id,
+      method: String(params.request?.method || "GET").slice(0, 16),
+      url: redactUrl(params.request?.url || ""),
+      type: String(params.type || "Other"),
+      initiator: params.initiator?.type || "",
+      ...(params.type === "Document" && params.loaderId ? { loader_id: params.loaderId } : {}),
+      started_at: Date.now(),
+      wall: params.timestamp,
+      done: false,
+    });
+  } else if (method === "Network.responseReceived") {
+    const entry = log.network.get(params.requestId);
+    if (!entry) return;
+    const response = params.response || {};
+    entry.status = Number(response.status || 0);
+    entry.status_text = String(response.statusText || "");
+    entry.mime_type = String(response.mimeType || "");
+    entry.from_cache = Boolean(response.fromDiskCache || response.fromServiceWorker || response.fromPrefetchCache);
+    if (params.type) entry.type = String(params.type);
+  } else if (method === "Network.loadingFinished") {
+    const entry = log.network.get(params.requestId);
+    if (!entry) return;
+    entry.done = true;
+    entry.size = Number(params.encodedDataLength || 0);
+    if (entry.wall) entry.duration_ms = Math.round((params.timestamp - entry.wall) * 1000);
+  } else if (method === "Network.loadingFailed") {
+    const entry = log.network.get(params.requestId);
+    if (!entry) return;
+    entry.done = true;
+    entry.failed = true;
+    entry.error = String(params.blockedReason ? `blocked: ${params.blockedReason}` : params.errorText || "failed");
+    if (params.canceled) entry.canceled = true;
+    if (entry.wall) entry.duration_ms = Math.round((params.timestamp - entry.wall) * 1000);
+  } else if (method === "Network.requestServedFromCache") {
+    const entry = log.network.get(params.requestId);
+    if (entry) entry.from_cache = true;
+  }
+}
+
+function inDevtoolsScope(log, entry, scope) {
+  return scope === "all" || entry.seq > log.page_seq;
+}
+
+function publicNetworkEntry(entry) {
+  const { wall: _wall, seq: _seq, loader_id: _loader, ...rest } = entry;
+  return rest;
+}
+
+// Recording that began a moment ago — by this read, or by the Coding
+// session's first command just before it — has not seen the page load.
+const DEVTOOLS_FRESH_MS = 1500;
+
+async function devtoolsLogFor(params) {
+  const tab = await resolveTab(params);
+  const startedNow = await startDevtoolsLog(tab);
+  const log = devtoolsLogs.get(tab.id);
+  return { tab, log, startedNow: startedNow || Date.now() - log.started_at < DEVTOOLS_FRESH_MS };
+}
+
+async function cmdConsole(params) {
+  const { log, startedNow } = await devtoolsLogFor(params);
+  const scope = params?.scope === "all" ? "all" : "page";
+  const minimum = CONSOLE_LEVELS[params?.level] ?? 0;
+  const needle = params?.contains ? String(params.contains).toLowerCase() : "";
+  const limit = Math.max(1, Math.min(200, Number(params?.limit) || 50));
+  const scoped = log.console.filter((entry) => inDevtoolsScope(log, entry, scope));
+  const matched = scoped.filter(
+    (entry) =>
+      (CONSOLE_LEVELS[entry.level] ?? 1) >= minimum &&
+      (!needle || entry.text.toLowerCase().includes(needle)),
+  );
+  const entries = matched.slice(-limit).map(({ seq: _seq, ...entry }) => entry);
+  const result = {
+    success: true,
+    started_now: startedNow,
+    capturing_since: log.started_at,
+    page_url: redactUrl(log.page_url),
+    total: matched.length,
+    entries,
+    earlier_pages: scope === "page" ? log.console.length - scoped.length : 0,
+    dropped: log.console_dropped,
+  };
+  if (params?.clear) {
+    log.console = [];
+    log.console_dropped = 0;
+  }
+  return result;
+}
+
+const NETWORK_TYPES = {
+  fetch: ["XHR", "Fetch", "EventSource"],
+  document: ["Document"],
+  script: ["Script"],
+  stylesheet: ["Stylesheet"],
+  image: ["Image"],
+  font: ["Font"],
+  websocket: ["WebSocket"],
+};
+
+function networkEntryFailed(entry) {
+  return Boolean(entry.failed) || Number(entry.status || 0) >= 400;
+}
+
+async function cmdNetwork(params) {
+  const { log, startedNow } = await devtoolsLogFor(params);
+  const scope = params?.scope === "all" ? "all" : "page";
+  const types = NETWORK_TYPES[params?.resource] || null;
+  const needle = params?.url_contains ? String(params.url_contains).toLowerCase() : "";
+  const method = params?.method ? String(params.method).toUpperCase() : "";
+  const limit = Math.max(1, Math.min(200, Number(params?.limit) || 50));
+  const all = [...log.network.values()];
+  const scoped = all.filter((entry) => inDevtoolsScope(log, entry, scope));
+  const matched = scoped.filter(
+    (entry) =>
+      (params?.filter !== "failed" || networkEntryFailed(entry)) &&
+      (!types || types.includes(entry.type)) &&
+      (!method || entry.method === method) &&
+      (!needle || entry.url.toLowerCase().includes(needle)),
+  );
+  const result = {
+    success: true,
+    started_now: startedNow,
+    capturing_since: log.started_at,
+    page_url: redactUrl(log.page_url),
+    total: matched.length,
+    entries: matched.slice(-limit).map(publicNetworkEntry),
+    earlier_pages: scope === "page" ? all.length - scoped.length : 0,
+    pending: all.filter((entry) => !entry.done).length,
+    dropped: log.network_dropped,
+  };
+  if (params?.clear) {
+    log.network.clear();
+    log.network_dropped = 0;
+  }
+  return result;
+}
+
+async function cmdNetworkBody(params) {
+  const tab = await resolveTab(params);
+  const log = devtoolsLogs.get(tab.id);
+  const requestId = String(params?.request_id || "");
+  if (!log || !requestId) throw new Error("network_body needs a request_id from the network action");
+  const entry = log.network.get(requestId);
+  if (!entry) throw new Error(`No recorded request ${requestId} on this tab`);
+  const maxChars = Math.max(100, Math.min(100000, Number(params?.max_chars) || 20000));
+  let body;
+  try {
+    body = await cdpSend(tab.id, "Network.getResponseBody", { requestId }, { showControl: false });
+  } catch (error) {
+    throw new Error(`Response body is not available (${error.message}); the browser keeps bodies only for recent requests of the current page.`);
+  }
+  const raw = String(body?.body || "");
+  if (body?.base64Encoded) {
+    return {
+      success: true,
+      request: publicNetworkEntry(entry),
+      base64_encoded: true,
+      size: Math.floor((raw.length * 3) / 4),
+      body: "",
+    };
+  }
+  return {
+    success: true,
+    request: publicNetworkEntry(entry),
+    base64_encoded: false,
+    size: raw.length,
+    truncated: raw.length > maxChars,
+    body: raw.slice(0, maxChars),
+  };
+}
+
+async function cmdDebugSummary(params) {
+  const { tab, log, startedNow } = await devtoolsLogFor(params);
+  const limit = Math.max(1, Math.min(50, Number(params?.limit) || 10));
+  const pageConsole = log.console.filter((entry) => inDevtoolsScope(log, entry, "page"));
+  const pageNetwork = [...log.network.values()].filter((entry) => inDevtoolsScope(log, entry, "page"));
+  const errors = pageConsole.filter((entry) => entry.level === "error");
+  const warnings = pageConsole.filter((entry) => entry.level === "warning");
+  const failed = pageNetwork.filter(networkEntryFailed);
+  const current = await chrome.tabs.get(tab.id);
+  return {
+    success: true,
+    started_now: startedNow,
+    capturing_since: log.started_at,
+    page_url: redactUrl(current.url || log.page_url),
+    title: current.title || "",
+    console_counts: {
+      error: errors.length,
+      warning: warnings.length,
+      total: pageConsole.length,
+    },
+    errors: errors.slice(-limit).map(({ seq: _seq, ...entry }) => entry),
+    warnings: warnings.slice(-Math.min(limit, 5)).map(({ seq: _seq, ...entry }) => entry),
+    network_counts: {
+      total: pageNetwork.length,
+      failed: failed.length,
+      pending: pageNetwork.filter((entry) => !entry.done).length,
+    },
+    failed_requests: failed.slice(-limit).map(publicNetworkEntry),
+  };
+}
+
 chrome.debugger.onEvent.addListener((source, method, params) => {
   const tabId = source.tabId;
   if (!tabId || !params) return;
+  recordDevtoolsEvent(tabId, method, params);
   const diagnostics = activeDiagnosticCapture(tabId);
   if (method === "Page.javascriptDialogOpening") {
     const history = pageDialogHistory.get(tabId) || [];
@@ -3026,6 +3480,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   agentPointerMotion.delete(tabId);
   networkInflight.delete(tabId);
   diagnosticCaptures.delete(tabId);
+  devtoolsLogs.delete(tabId);
   activePageDialogs.delete(tabId);
   pageDialogHistory.delete(tabId);
   notifyAutomationState("tab_closed", tabId);
@@ -3083,9 +3538,10 @@ function waitForTabComplete(tabId, timeoutMs) {
 
 // The page a navigation actually reached: its address after any redirect
 // (server or client-side router), its title, and whether the load finished.
-async function landedPage(tabId, requestedUrl, loaded) {
+async function landedPage(tabId, requestedUrl, loaded, params = {}) {
   let current = await chrome.tabs.get(tabId);
   let url = current.url || current.pendingUrl || requestedUrl || "";
+  let devtoolsStarted = false;
   if (browserOrigin(url)) {
     await waitForDomSettled(tabId);
     await ensureDebuggerAttached(tabId);
@@ -3095,6 +3551,11 @@ async function landedPage(tabId, requestedUrl, loaded) {
     } catch {
       url = current.url || url;
     }
+    // Coming from a page the debugger cannot record (chrome://newtab), the
+    // load itself went unseen; start now and say so.
+    if (params?._webbridge_devtools === "capture" && !devtoolsLogs.has(tabId)) {
+      devtoolsStarted = await startDevtoolsLog(current).catch(() => false);
+    }
   }
   await broadcastTabInfo();
   return {
@@ -3103,6 +3564,7 @@ async function landedPage(tabId, requestedUrl, loaded) {
     title: current.title || "",
     ...(requestedUrl ? { redirected: !sameUrl(url, requestedUrl) } : {}),
     timed_out: !loaded,
+    ...(devtoolsStarted ? { devtools_started: true } : {}),
   };
 }
 
@@ -3125,7 +3587,7 @@ async function cmdNavigate(params) {
   }
   if (sameDocument) load.cancel();
   const loaded = sameDocument ? true : await load.done;
-  return landedPage(tab.id, params.url, loaded);
+  return landedPage(tab.id, params.url, loaded, params);
 }
 
 // back/forward land either on a loaded document or, for an entry an SPA
@@ -3158,7 +3620,7 @@ async function historyStep(params, step) {
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    return landedPage(tab.id, null, loaded);
+    return landedPage(tab.id, null, loaded, params);
   } finally {
     load.cancel();
   }
@@ -3761,7 +4223,7 @@ async function cmdReload(params) {
     load.cancel();
     throw e;
   }
-  return landedPage(tab.id, null, await load.done);
+  return landedPage(tab.id, null, await load.done, params);
 }
 
 // ── Wait / element-based actions ─────────────────────────────────────────────

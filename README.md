@@ -52,6 +52,19 @@ Chrome DevTools Protocol (`chrome.debugger`):
   fall back to coordinates.
 - **Crawling** — scroll_to_bottom for lazy content and the backend-composed
   crawl action for concurrent extraction across background tabs.
+- **Debugging** — console, network, network_body and debug_summary read a
+  per-tab devtools log built from `Runtime`, `Log` and `Network` CDP events:
+  every console level with source location and stack, uncaught exceptions,
+  browser log entries (failed resource loads, CSP), and each request's method,
+  status, resource type, timing, failure reason and redirect hops. The newest
+  300 console entries and 300 requests are kept per tab across navigations;
+  reads default to the current page (`scope: "all"` for earlier ones).
+  Recording starts on the first such read, or with the first command that
+  carries `_webbridge_devtools: "capture"` (EvoFlux Coding sessions) — never
+  unasked, since `Runtime.enable` is visible to page scripts. Credential-shaped
+  values (Bearer tokens, JWTs, cookies, secret-named query parameters and JSON
+  keys) are redacted; paths and identifiers are kept for debugging. This is
+  separate from the user's opt-in **Report issue evidence** capture below.
 
 Screenshots are captured at CSS-pixel scale (`clip.scale = 1`), so a click at
 the x,y a model reads off the image lands correctly even on HiDPI/Retina
