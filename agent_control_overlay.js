@@ -9,8 +9,9 @@
   if (globalThis.__evofluxAgentControlOverlay) return;
 
   const HOST_ID = "__evoflux-agent-control-overlay";
-  const TIP_X = 4;
-  const TIP_Y = 2.7;
+  // Arrow tip (4, 2.7 of the 24×27 viewBox) inside the 14.22×16 cursor box.
+  const TIP_X = 2.37;
+  const TIP_Y = 1.6;
   let host = null;
   let cursor = null;
   let cursorPulse = null;
@@ -64,28 +65,28 @@
         }
         .badge-dot { width: 7px; height: 7px; border-radius: 50%; background: #7ffcff; box-shadow: 0 0 9px #5effff; animation: evoflux-dot 1s ease-in-out infinite alternate; }
         .cursor {
-          position: absolute; left: 0; top: 0; width: 24px; height: 27px;
+          position: absolute; left: 0; top: 0; width: 14.22px; height: 16px;
           transform: translate3d(var(--cursor-x, 72vw), var(--cursor-y, 34vh), 0);
-          transform-origin: 4px 2.7px;
+          transform-origin: 2.37px 1.6px;
           transition: transform 28ms linear;
           will-change: transform;
         }
         .cursor-aura {
-          position: absolute; left: -7px; top: -7px; width: 25px; height: 25px;
+          position: absolute; left: -4.5px; top: -4.5px; width: 15px; height: 15px;
           border-radius: 50%; opacity: .46;
           background: radial-gradient(circle, rgba(255,255,255,.34) 0 8%, rgba(119,92,255,.24) 32%, rgba(67,210,255,.11) 54%, transparent 74%);
-          filter: blur(3px);
+          filter: blur(2px);
         }
         .cursor svg {
           position: relative; display: block; width: 100%; height: 100%; overflow: visible;
-          filter: drop-shadow(0 1px 1px rgba(0,0,0,.5)) drop-shadow(0 0 4px rgba(126,93,255,.58)) drop-shadow(0 0 8px rgba(67,210,255,.22));
+          filter: drop-shadow(0 1px 1px rgba(0,0,0,.5)) drop-shadow(0 0 3px rgba(126,93,255,.58)) drop-shadow(0 0 5px rgba(67,210,255,.22));
         }
-        .cursor-glow { fill: none; stroke: rgba(123,91,255,.68); stroke-width: 5.5; stroke-linejoin: round; stroke-linecap: round; opacity: .42; filter: blur(2px); }
+        .cursor-glow { fill: none; stroke: rgba(123,91,255,.68); stroke-width: 5.5; stroke-linejoin: round; stroke-linecap: round; opacity: .42; filter: blur(1.5px); }
         .cursor-outline { fill: none; stroke: rgba(255,255,255,.99); stroke-width: 3.8; stroke-linejoin: round; stroke-linecap: round; }
         .cursor-core { fill: url(#evoflux-cursor-fill); stroke: #030407; stroke-width: .9; stroke-linejoin: round; stroke-linecap: round; }
         .cursor-pulse {
-          position: absolute; left: -5px; top: -5px; width: 17px; height: 17px;
-          border: 2px solid rgba(126,102,255,.86); box-shadow: 0 0 8px rgba(70,211,255,.72); border-radius: 50%; opacity: 0; transform: scale(.25);
+          position: absolute; left: -3px; top: -3px; width: 10px; height: 10px;
+          border: 1.5px solid rgba(126,102,255,.86); box-shadow: 0 0 8px rgba(70,211,255,.72); border-radius: 50%; opacity: 0; transform: scale(.25);
         }
         .cursor.pressed { transform: translate3d(var(--cursor-x), var(--cursor-y), 0) scale(.9); transition-duration: 55ms; }
         .cursor.pressed .cursor-aura { opacity: .78; filter: blur(2px); }
