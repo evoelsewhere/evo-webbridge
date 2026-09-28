@@ -84,7 +84,7 @@ const pageDialogHistory = new Map();
 
 const COMMAND_CAPABILITIES = [
   "navigate", "click", "dblclick", "type", "key", "scroll", "screenshot",
-  "extract", "get_tabs", "switch_tab", "evaluate", "back", "forward",
+  "extract", "get_tabs", "switch_tab", "back", "forward",
   "reload", "wait", "wait_for_selector", "wait_for_text", "wait_for_load",
   "wait_for_network_idle", "wait_for_url", "click_selector", "click_text", "hover", "focus",
   "select_option", "set_checked", "drag", "drag_to_point", "fill", "open_tab", "close_tab",
@@ -1883,9 +1883,6 @@ async function runCommand(action, params) {
         break;
       case "switch_tab":
         result = await cmdSwitchTab(params);
-        break;
-      case "evaluate":
-        result = await cmdEvaluate(params);
         break;
       case "back":
         result = await cmdBack(params);
@@ -5313,30 +5310,6 @@ async function cmdCloseTab(params) {
   await chrome.tabs.remove(tabId);
   await broadcastTabInfo();
   return { success: true, tab_id: tabId };
-}
-
-async function cmdEvaluate(params) {
-  const tab = await resolveTab(params);
-
-  const { script } = params;
-
-  const result = await cdpSend(tab.id, "Runtime.evaluate", {
-    expression: script,
-    returnByValue: true,
-    awaitPromise: true,
-  });
-
-  if (result.exceptionDetails) {
-    const ex = result.exceptionDetails;
-    throw new Error(ex.exception?.description || ex.text || "Script error");
-  }
-
-  return {
-    success: true,
-    value: result.result?.value,
-    type: result.result?.type,
-    description: result.result?.description,
-  };
 }
 
 async function cmdBack(params) {
