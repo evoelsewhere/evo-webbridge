@@ -54,16 +54,6 @@
           box-shadow: inset 0 0 18px rgba(82, 247, 255, .42);
           animation: evoflux-frame-wave 1.8s ease-out infinite;
         }
-        .badge {
-          position: absolute; top: 11px; left: 50%; transform: translateX(-50%);
-          display: flex; align-items: center; gap: 7px; padding: 6px 11px;
-          border: 1px solid rgba(133, 249, 255, .72); border-radius: 999px;
-          background: rgba(5, 11, 28, .82); color: #eaffff;
-          box-shadow: 0 0 12px rgba(55, 240, 255, .5), 0 0 24px rgba(55, 210, 228, .18);
-          font: 700 10px/1.1 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-          letter-spacing: .13em; text-transform: uppercase; backdrop-filter: blur(8px);
-        }
-        .badge-dot { width: 7px; height: 7px; border-radius: 50%; background: #7ffcff; box-shadow: 0 0 9px #5effff; animation: evoflux-dot 1s ease-in-out infinite alternate; }
         .cursor {
           position: absolute; left: 0; top: 0; width: 14.22px; height: 16px;
           transform: translate3d(var(--cursor-x, 72vw), var(--cursor-y, 34vh), 0);
@@ -99,16 +89,14 @@
           0% { opacity: .8; box-shadow: inset 0 0 8px rgba(82, 247, 255, .48); }
           70%, 100% { opacity: .12; box-shadow: inset 0 0 54px rgba(82, 247, 255, .08); }
         }
-        @keyframes evoflux-dot { from { opacity: .55; transform: scale(.82); } to { opacity: 1; transform: scale(1.2); } }
         @keyframes evoflux-click { 0% { opacity: 1; transform: scale(.25); } 100% { opacity: 0; transform: scale(2.2); } }
         @media (prefers-reduced-motion: reduce) {
-          .frame, .frame::after, .badge-dot { animation: none; }
+          .frame, .frame::after { animation: none; }
           .cursor { transition-duration: 0ms; }
         }
       </style>
       <div class="layer">
         <div class="frame"></div>
-        <div class="badge"><span class="badge-dot"></span><span>EvoFlux control</span></div>
         <div class="cursor">
           <span class="cursor-aura"></span>
           <span class="cursor-pulse"></span>
