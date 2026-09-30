@@ -1,0 +1,158 @@
+name: Release Chrome extension
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_mode:
+        description: What should the workflow do?
+        required: true
+        default: package
+        type: choice
+        options:
+          - package
+          - upload
+          - publish
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chrome-extension-release
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Validate and package
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Validate JavaScript syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' source_file; do
+            node --check "$source_file"
+          done < <(find . -maxdepth 1 -type f -name '*.js' -print0)
+
+      - name: Read and validate release metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(jq -er '.version | select(type == "string" and test("^[0-9]+(\\.[0-9]+){0,3}$"))' manifest.json)"
+          artifact_name="evoflux-webbridge-v${version}"
+
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} must match manifest version v${version}." >&2
+            exit 1
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${artifact_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Chrome Web Store ZIP
+        shell: bash
+        run: ./scripts/package-extension.sh "dist/${{ steps.metadata.outputs.artifact_name }}.zip"
+
+      - name: Verify packaged manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_path="dist/${{ steps.metadata.outputs.artifact_name }}.zip"
+          packaged_version="$(unzip -p "$package_path" manifest.json | jq -er .version)"
+          test "$packaged_version" = "${{ steps.metadata.outputs.version }}"
+          unzip -p "$package_path" manifest.json | jq -e 'has("key") | not' >/dev/null
+          unzip -l "$package_path"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: dist/${{ steps.metadata.outputs.artifact_name }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  chrome-web-store:
+    name: ${{ github.event_name == 'push' && 'Publish to Chrome Web Store' || 'Chrome Web Store operation' }}
+    if: github.event_name == 'push' || inputs.release_mode != 'package'
+    needs: package
+    runs-on: ubuntu-latest
+    environment: chrome-web-store
+    env:
+      CHROME_PUBLISHER_ID: ${{ vars.CHROME_PUBLISHER_ID }}
+      CHROME_EXTENSION_ID: ${{ vars.CHROME_EXTENSION_ID }}
+      CHROME_CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
+      CHROME_CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
+      CHROME_REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}
+      RELEASE_MODE: ${{ github.event_name == 'push' && 'publish' || inputs.release_mode }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download packaged extension
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.package.outputs.artifact_name }}
+          path: dist
+
+      - name: Validate Chrome Web Store configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${CHROME_PUBLISHER_ID:-}" ]]; then
+            echo "Environment variable CHROME_PUBLISHER_ID is not configured." >&2
+            exit 1
+          fi
+          if [[ ! "${CHROME_EXTENSION_ID:-}" =~ ^[a-p]{32}$ ]]; then
+            echo "CHROME_EXTENSION_ID must be the 32-character item ID from the Developer Dashboard." >&2
+            exit 1
+          fi
+
+      - name: Upload or publish on Chrome Web Store
+        shell: bash
+        run: |
+          ./scripts/publish-chrome.sh \
+            "dist/${{ needs.package.outputs.artifact_name }}.zip" \
+            "$RELEASE_MODE"
+
+  github-release:
+    name: Create GitHub release
+    if: github.event_name == 'push'
+    needs:
+      - package
+      - chrome-web-store
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged extension
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.package.outputs.artifact_name }}
+          path: dist
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_path="dist/${{ needs.package.outputs.artifact_name }}.zip"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$package_path" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$package_path" --verify-tag --generate-notes
+          fi

@@ -43,8 +43,7 @@ Chrome DevTools Protocol (`chrome.debugger`):
   mirrors an active dialog in its AskUser-style question surface so the user can
   respond when the agent hands control back.
 - **Reading** — screenshot (viewport or full_page, at CSS-pixel scale),
-  extract (text/Markdown/HTML), extract_elements (structured records), and
-  evaluate.
+  extract (text/Markdown/HTML), and extract_elements (structured records).
 - **Semantic productivity surfaces** — semantic_snapshot/read/select/write use
   accessibility-first opaque targets, verified rich-text writes, bounded
   spreadsheet ranges/matrices, and PowerPoint text-object probes. Unsupported
@@ -121,6 +120,13 @@ enforced against the tab actually being driven.
    the EvoFlux repository.
 3. Start EvoFlux Desktop, then click the WebBridge icon in the toolbar. The
    extension discovers and connects to the running app automatically.
+
+## Release
+
+The GitHub Actions pipeline can package the extension, upload a draft, or submit
+it to Chrome Web Store for review. See
+[Chrome Web Store release pipeline](docs/chrome-web-store-release.md) for the
+one-time credentials setup and release procedure.
 
 ## Connection
 
@@ -347,8 +353,9 @@ uv run python scripts/webbridge_office_smoke.py powerpoint-online <session-id>
 - Domain policy checks explicit background-tab actions against that tab's URL,
   not the active tab. When a domain policy is configured and the target URL is
   unknown, the backend fails closed instead of forwarding the command.
-- Password values are omitted from semantic snapshots. Arbitrary page reads
-  remain possible through `extract`/`evaluate`, subject to backend policy.
+- Password values are omitted from semantic snapshots. Page reading remains
+  bounded to the extension's supported extraction and semantic-reading
+  commands and is subject to backend policy.
 - Chrome normally shows a **"…started debugging this browser"** infobar
   whenever an extension uses the `debugger` (CDP) API. The guided launch
   (**WebBridge → Launch browser**, or the backend `launch-browser` endpoint)
@@ -372,7 +379,6 @@ webbridge:
   blocked_domains:         # always refused (takes precedence)
     - mybank.com
     - mail.google.com
-  allow_evaluate: true     # set false to forbid arbitrary-JS `evaluate`
   audit_log_size: 200      # entries kept for GET /api/team/webbridge/audit
   sharing:
     default: ask           # ask | allow | block for browser -> EvoFlux data
