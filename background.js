@@ -84,7 +84,7 @@ const pageDialogHistory = new Map();
 
 const COMMAND_CAPABILITIES = [
   "navigate", "click", "dblclick", "type", "key", "scroll", "screenshot",
-  "extract", "get_tabs", "switch_tab", "back", "forward",
+  "extract", "get_tabs", "switch_tab", "focus_tab", "back", "forward",
   "reload", "wait", "wait_for_selector", "wait_for_text", "wait_for_load",
   "wait_for_network_idle", "wait_for_url", "click_selector", "click_text", "hover", "focus",
   "select_option", "set_checked", "drag", "drag_to_point", "fill", "open_tab", "close_tab",
@@ -99,6 +99,10 @@ const COMMAND_CAPABILITIES = [
 // caller can tell a browser that speaks refs from one that does not.
 const COMMAND_FEATURES = [
   "refs", "shadow_dom", "same_origin_frames", "batch", "diff_snapshot", "devtools_log",
+  // Non-intrusive tab targeting (plan §3.0): no silent active-tab fallback,
+  // switch_tab re-targets without focusing, and focus_tab is the single
+  // explicit way for an agent to take focus.
+  "non_intrusive_v1", "focus_tab", "switch_rebind",
 ];
 
 // ── Config (persisted in chrome.storage.local, edited in Side Chat settings) ─
@@ -1884,6 +1888,9 @@ async function runCommand(action, params) {
       case "switch_tab":
         result = await cmdSwitchTab(params);
         break;
+      case "focus_tab":
+        result = await cmdFocusTab(params);
+        break;
       case "back":
         result = await cmdBack(params);
         break;
@@ -2452,9 +2459,44 @@ async function capturePanelContext(tab, kind) {
   };
 }
 
-// Resolve the tab a command targets: an explicit params.tab_id (so a session
-// can pin a tab and stay deterministic even if the user switches tabs), else
-// the active tab.
+// ── Target-audit ring ────────────────────────────────────────────────────
+// Every deliberate use of the target:"active" escape hatch (and of focus_tab)
+// lands in this bounded ring in chrome.storage.session, mirroring the
+// ChatGPT extension's browser-management audit trail: last TARGET_AUDIT_MAX
+// entries, entries older than TARGET_AUDIT_TTL_MS pruned on write. Session
+// storage never outlives the browser session.
+const TARGET_AUDIT_STORAGE_KEY = "webbridgeTargetAuditTrail";
+const TARGET_AUDIT_MAX = 50;
+const TARGET_AUDIT_TTL_MS = 4320 * 60 * 1000; // 30 days, same bound as the GPT ring (@167201)
+let targetAuditWriteChain = Promise.resolve();
+
+async function recordTargetAudit(entry) {
+  // Serialized through one promise chain so concurrent commands cannot
+  // interleave read-modify-write of the ring.
+  targetAuditWriteChain = targetAuditWriteChain.catch(() => {}).then(async () => {
+    try {
+      const storage = chrome.storage.session || chrome.storage.local;
+      const now = Date.now();
+      const data = await storage.get(TARGET_AUDIT_STORAGE_KEY).catch(() => ({}));
+      const trail = (Array.isArray(data[TARGET_AUDIT_STORAGE_KEY]) ? data[TARGET_AUDIT_STORAGE_KEY] : [])
+        .filter((e) => e && typeof e.at === "number" && now - e.at < TARGET_AUDIT_TTL_MS);
+      trail.push({ ...entry, at: now });
+      await storage.set({ [TARGET_AUDIT_STORAGE_KEY]: trail.slice(-TARGET_AUDIT_MAX) });
+    } catch (error) {
+      console.warn("[WebBridge] Audit entry unavailable:", error.message);
+    }
+  });
+  return targetAuditWriteChain;
+}
+
+// Resolve the tab a command targets. Fail-closed: an explicit params.tab_id
+// (so a session can pin a tab and stay deterministic even if the user
+// switches tabs), or the explicit escape hatch params.target === "active" —
+// the one way for an agent to deliberately act on the tab the user is
+// currently viewing, recorded in the audit ring. Without either, refuse
+// instead of silently falling back to whatever tab the user happens to be
+// reading: that fallback is how an unbound session ended up clicking and
+// typing in the user's own tab.
 async function resolveTab(params) {
   let tab;
   if (params && params.tab_id != null) {
@@ -2463,9 +2505,19 @@ async function resolveTab(params) {
     } catch {
       throw new Error(`Tab ${params.tab_id} not found`);
     }
-  } else {
+  } else if (params && params.target === "active") {
     tab = await getActiveTab();
     if (!tab) throw new Error("No active tab");
+    await recordTargetAudit({
+      event: "target_active_escape_hatch",
+      tab_id: tab.id,
+      window_id: tab.windowId,
+      url: boundedText(tab.url || tab.pendingUrl || "").slice(0, 300),
+    });
+  } else {
+    throw new Error(
+      "UNBOUND_TARGET: no tab_id and no session binding for this command; refusing active-tab fallback. Pass tab_id (from get_tabs/switch_tab), or deliberately target the user's current tab with target:\"active\".",
+    );
   }
   if (await humanLeaseForTab(tab)) {
     throw new Error("Human control is active for this tab. Wait for the user to resume the agent.");
@@ -5239,6 +5291,10 @@ async function cmdGetTabs() {
   };
 }
 
+// switch_tab only selects the tab the session acts on — it never focuses it
+// (plan §3.0, D2a). The response's tab_id is what the backend rebinds the
+// session to; taking focus is exclusively focus_tab's job, so an agent
+// working through tabs can never steal the one the user is reading.
 async function cmdSwitchTab(params) {
   const { index, id } = params;
 
@@ -5249,8 +5305,6 @@ async function cmdSwitchTab(params) {
     if (await humanLeaseForWindow(tab.windowId)) {
       throw new Error("Human control is active in this window. Wait for the user to resume the agent.");
     }
-    await chrome.tabs.update(id, { active: true });
-    await chrome.windows.update(tab.windowId, { focused: true });
     if (browserOrigin(tab.url || tab.pendingUrl || "")) await ensureDebuggerAttached(tab.id);
     await broadcastTabInfo();
     return { success: true, tab_id: id };
@@ -5262,8 +5316,6 @@ async function cmdSwitchTab(params) {
     if (await humanLeaseForWindow(tab.windowId)) {
       throw new Error("Human control is active in this window. Wait for the user to resume the agent.");
     }
-    await chrome.tabs.update(tab.id, { active: true });
-    await chrome.windows.update(tab.windowId, { focused: true });
     if (browserOrigin(tab.url || tab.pendingUrl || "")) await ensureDebuggerAttached(tab.id);
     await broadcastTabInfo();
     return { success: true, tab_id: tab.id };
@@ -5272,10 +5324,41 @@ async function cmdSwitchTab(params) {
   throw new Error(`Tab index ${index} out of range`);
 }
 
+// focus_tab is the single place the extension takes focus (plan §3.0, D2a):
+// the agent calls it explicitly when the user must see the tab it is working
+// on. Mirrors the ChatGPT extension's focusTab — validate a positive integer
+// tab id, respect the human-lease guard, then focus tab and window together.
+// Every call is recorded in the target-audit ring. Debugger attach and the
+// tab broadcast are left to the next CDP command / the onActivated listener.
+async function cmdFocusTab(params) {
+  const tabId = params?.tab_id;
+  if (!Number.isSafeInteger(tabId) || tabId <= 0) {
+    throw new Error("focus_tab requires params.tab_id, a positive integer tab id.");
+  }
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    throw new Error(`Tab ${tabId} not found`);
+  }
+  if (await humanLeaseForWindow(tab.windowId)) {
+    throw new Error("Human control is active in this window. Wait for the user to resume the agent.");
+  }
+  await chrome.tabs.update(tabId, { active: true });
+  await chrome.windows.update(tab.windowId, { focused: true });
+  await recordTargetAudit({ event: "focus_tab", tab_id: tabId, window_id: tab.windowId });
+  return { success: true, tab_id: tabId, focused: true };
+}
+
+// open_tab opens in the background by default (plan §3.0, D2a): the contract
+// param is `focus` (default false); the legacy `active` key older backends
+// still send is deliberately not read — honoring its old default (true) would
+// put focus-stealing back exactly where P0 removed it. The grouped-session
+// path inherits the same background default (createGroupedSessionTab).
 async function cmdOpenTab(params) {
-  const { url, active = true } = params;
+  const { url, focus = false } = params;
   if (!url) throw new Error("open_tab requires a url");
-  if (active) {
+  if (focus) {
     const current = await getActiveTab();
     if (current && await humanLeaseForWindow(current.windowId)) {
       throw new Error("Human control is active in this window. Open the tab in background or wait for the user to resume the agent.");
@@ -5284,9 +5367,9 @@ async function cmdOpenTab(params) {
   const parentTabId = params._webbridge_parent_tab_id;
   if (parentTabId != null) {
     const parentTab = await chrome.tabs.get(parentTabId);
-    return createGroupedSessionTab(parentTab, params._webbridge_session_id, { url, active });
+    return createGroupedSessionTab(parentTab, params._webbridge_session_id, { url, active: focus });
   }
-  const tab = await chrome.tabs.create({ url, active });
+  const tab = await chrome.tabs.create({ url, active: focus });
   await broadcastTabInfo();
   return { success: true, tab_id: tab.id, url };
 }
