@@ -13,7 +13,11 @@ The extension opens a persistent WebSocket to the EvoFlux backend relay
 Chrome DevTools Protocol (`chrome.debugger`):
 
 - **Navigation/tabs** — navigate, back, forward, reload, get_tabs, switch_tab,
-  open_tab, close_tab. navigate/back/forward/reload wait for the page (up to
+  focus_tab, open_tab, close_tab. `switch_tab` only selects which tab the
+  session acts on (it returns the `tab_id` and never steals focus);
+  `focus_tab {tab_id}` is the one command that brings a tab to the front, and
+  `open_tab` opens in the background unless `focus: true` is passed.
+  navigate/back/forward/reload wait for the page (up to
   30 s for a load, 10 s for a history step) and return the URL it landed on,
   its title and `timed_out`; navigate also reports `redirected`. URLs are
   compared in canonical form, so `http://localhost:3000` matches the
@@ -108,9 +112,13 @@ Chrome DevTools Protocol (`chrome.debugger`):
 
 Screenshots are captured at CSS-pixel scale (`clip.scale = 1`), so a click at
 the x,y a model reads off the image lands correctly even on HiDPI/Retina
-displays. Page-scoped commands may carry a `tab_id` from get_tabs to pin a
-specific tab instead of the active one. The extension broadcasts complete tab
-state (including background and pending URLs), so backend domain policy is
+displays. Page-scoped commands are fail-closed about which tab they act on: a
+command carries a `tab_id` from get_tabs (or from switch_tab's returned
+`tab_id`), and a command with neither a tab_id nor a session binding fails
+with `UNBOUND_TARGET` instead of falling back to the active tab — unless it
+deliberately passes `target: "active"`, which is recorded in a bounded audit
+ring in session storage. The extension broadcasts complete tab state
+(including background and pending URLs), so backend domain policy is
 enforced against the tab actually being driven.
 
 ## Install
@@ -432,3 +440,17 @@ node --check extensions/webbridge/teach_recorder.js
 node --check extensions/webbridge/text_watch.js
 node --test tests/webbridge_extension.test.cjs
 ```
+
+CI runs the same syntax check over every top-level `.js` file (from the
+extension repo root):
+
+```bash
+find . -maxdepth 1 -name '*.js' -exec node --check {} \;
+```
+
+Manual smoke check for tab targeting (plan §5.2 T1–T5): with two tabs open and
+the user reading tab A, a session not yet bound to a tab gets `UNBOUND_TARGET`
+from a page command; `switch_tab` to tab B returns `{tab_id: B}` and leaves tab
+A focused; `open_tab` opens in the background unless `focus: true` is passed;
+`focus_tab {tab_id: B}` is the only call that switches and focuses; while a
+human-control lease is held, `switch_tab` and `focus_tab` refuse.

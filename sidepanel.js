@@ -1382,6 +1382,14 @@ function renderBindingStatus() {
         || "Browser tools activate on HTTP(S) pages";
     return;
   }
+  if (!selectedSessionId) {
+    // Lazy tab session: composer stays live, created on the first send.
+    composer.disabled = false;
+    sendBtn.disabled = composerSending;
+    bindingStatus.textContent = "New tab chat";
+    contextDetail.textContent = "Send a message to create this tab's session";
+    return;
+  }
   bindingStatus.textContent = "Preparing tab session";
   contextDetail.textContent = "WebBridge creates it automatically";
 }
@@ -1733,7 +1741,7 @@ async function loadHistory({ before = null, prepend = false } = {}) {
   const sessionId = selectedSessionId;
   const loadGeneration = ++historyLoadGeneration;
   if (!sessionId) {
-    showEmptyTranscript("EvoFlux is preparing this tab session.");
+    showEmptyTranscript("Send a message to start this tab's chat.");
     return;
   }
   let cursor = before;
@@ -2046,9 +2054,11 @@ async function submitQuestion(request, inputs, button) {
   }
 }
 
-async function resolvePanelSession(tab) {
+async function resolvePanelSession(tab, { createIfMissing = false } = {}) {
+  // Lazy: refreshes resolve existing bindings; only the first send provisions.
   const response = await chrome.runtime.sendMessage({
     type: "ensure_browser_session_for_tab",
+    create_if_missing: createIfMissing,
   });
   if (!response?.ok) throw new Error(response?.error || "Could not prepare this tab session");
   if (response.tab?.id !== tab.id) throw new Error("The active browser tab changed while Side Chat was loading.");
@@ -3166,7 +3176,26 @@ async function sendMessage() {
   const shell = Boolean(intercepted.shell || rawContent.startsWith("!"));
   const content = shell ? String(intercepted.content || rawContent).replace(/^!\s*/, "").trim() : intercepted.content;
   const sourceScope = browserTabScope(activeTab);
-  if (!content || !selectedSessionId || !activeTab?.id) return;
+  if (!content || !activeTab?.id) return;
+  if (!selectedSessionId) {
+    // Lazy tab sessions: provision + bind only when the user actually sends.
+    try {
+      setComposerStatus("Preparing tab session...");
+      const response = await chrome.runtime.sendMessage({
+        type: "ensure_browser_session_for_tab",
+        create_if_missing: true,
+      });
+      if (!response?.ok) throw new Error(response?.error || "Could not prepare this tab session.");
+      if (response.tab?.id !== activeTab.id) {
+        throw new Error("The active browser tab changed while the tab session was preparing.");
+      }
+      await refreshPanel({ preserveTranscript: true });
+      if (!selectedSessionId) throw new Error("Could not prepare this tab session.");
+    } catch (error) {
+      setComposerStatus(error?.message || String(error), "error");
+      return;
+    }
+  }
   if (!isBoundToSelectedSession()) {
     setNotice("Bind this tab to the selected session before sending a message.", "error");
     return;
