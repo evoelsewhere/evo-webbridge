@@ -53,6 +53,8 @@ const MAX_DIAGNOSTIC_ENTRIES = 30;
 let ws = null;
 let extensionId = null; // loaded/persisted in chrome.storage.local (stable across SW restarts)
 const sessionGroupLocks = new Map();
+// sessionId -> Chrome tab-group id (the first open_tab seeds the group).
+const sessionGroupIds = new Map();
 let textWatchMutation = Promise.resolve();
 let connected = false;
 let reconnectTimer = null;
@@ -81,10 +83,78 @@ const agentPointerPositions = new Map();
 const agentPointerMotion = new Map();
 const activePageDialogs = new Map();
 const pageDialogHistory = new Map();
+// --- session state persisted across MV3 service-worker restarts ---
+// The SW dies after ~30s idle; unpersisted, release_session finds no groups
+// and the badge reads an empty overlay set. Hydrated on every SW wake.
+const SESSION_STATE_KEYS = { groups: "wbSessionGroupIds", overlays: "wbAgentControlOverlays" };
+let sessionStateHydrated = false;
+let sessionStateHydratePromise = null;
+
+function sessionStateStorage() {
+  return chrome.storage.session || chrome.storage.local;
+}
+
+async function persistSessionState() {
+  // Never clobber stored state before the first hydration completes.
+  if (!sessionStateHydrated) return;
+  try {
+    await sessionStateStorage().set({
+      [SESSION_STATE_KEYS.groups]: [...sessionGroupIds.entries()],
+      [SESSION_STATE_KEYS.overlays]: [...agentControlOverlays],
+    });
+  } catch (error) {
+    console.warn("[WebBridge] Failed to persist session state:", error.message);
+  }
+}
+
+function hydrateSessionState() {
+  if (sessionStateHydrated) return Promise.resolve();
+  if (sessionStateHydratePromise) return sessionStateHydratePromise;
+  sessionStateHydratePromise = (async () => {
+    try {
+      const data = await sessionStateStorage().get([
+        SESSION_STATE_KEYS.groups,
+        SESSION_STATE_KEYS.overlays,
+      ]);
+      for (const [key, groupId] of data[SESSION_STATE_KEYS.groups] || []) {
+        sessionGroupIds.set(key, groupId);
+      }
+      for (const tabId of data[SESSION_STATE_KEYS.overlays] || []) {
+        agentControlOverlays.add(tabId);
+      }
+    } catch (error) {
+      console.warn("[WebBridge] Failed to hydrate session state:", error.message);
+    } finally {
+      sessionStateHydrated = true;
+    }
+  })();
+  return sessionStateHydratePromise;
+}
+
+function trackSessionGroup(sessionId, groupId) {
+  if (sessionId == null) return;
+  sessionGroupIds.set(String(sessionId), groupId);
+  persistSessionState();
+}
+
+function untrackSessionGroup(key) {
+  sessionGroupIds.delete(key);
+  persistSessionState();
+}
+
+function trackOverlayTab(tabId) {
+  agentControlOverlays.add(tabId);
+  persistSessionState();
+}
+
+function untrackOverlayTab(tabId) {
+  agentControlOverlays.delete(tabId);
+  persistSessionState();
+}
 
 const COMMAND_CAPABILITIES = [
   "navigate", "click", "dblclick", "type", "key", "scroll", "screenshot",
-  "extract", "get_tabs", "switch_tab", "back", "forward",
+  "extract", "get_tabs", "switch_tab", "focus_tab", "back", "forward",
   "reload", "wait", "wait_for_selector", "wait_for_text", "wait_for_load",
   "wait_for_network_idle", "wait_for_url", "click_selector", "click_text", "hover", "focus",
   "select_option", "set_checked", "drag", "drag_to_point", "fill", "open_tab", "close_tab",
@@ -92,13 +162,15 @@ const COMMAND_CAPABILITIES = [
   "semantic_write", "extract_elements", "scroll_to_bottom", "resize",
   "reset_viewport", "dialogs", "handle_dialog", "status", "batch",
   "console", "network", "network_body", "debug_summary", "wait_for_hmr",
-  "storage", "cookies", "inspect", "upload_file", "emulate", "mock", "performance",
+  "storage", "cookies", "inspect", "evaluate", "upload_file", "emulate", "mock", "performance",
+  "release_session",
 ];
 
 // Bumped when the agent-facing behaviour of the commands changes, so the
 // caller can tell a browser that speaks refs from one that does not.
 const COMMAND_FEATURES = [
   "refs", "shadow_dom", "same_origin_frames", "batch", "diff_snapshot", "devtools_log",
+  "non_intrusive_v1", "focus_tab", "switch_rebind",
 ];
 
 // ── Config (persisted in chrome.storage.local, edited in Side Chat settings) ─
@@ -393,6 +465,30 @@ function showWatchMatch(tabId) {
 function clearWatchMatch(tabId) {
   if (!chrome.action) return;
   chrome.action.setBadgeText({ tabId, text: "" });
+}
+
+// Global badge: green = agent driving, red = human lease held, none = idle.
+async function refreshAgentBadge() {
+  if (!chrome.action) return;
+  await hydrateSessionState();
+  try {
+    const leases = await readHumanControlLeases();
+    const humanActive = Object.keys(leases).length > 0;
+    const agentActive = agentControlOverlays.size > 0;
+    let text = "";
+    let color = "#16a34a";
+    if (humanActive) {
+      text = "●";
+      color = "#dc2626";
+    } else if (agentActive) {
+      text = "●";
+      color = "#16a34a";
+    }
+    await chrome.action.setBadgeText({ text });
+    await chrome.action.setBadgeBackgroundColor({ color });
+  } catch (error) {
+    console.warn("[WebBridge] Failed to refresh agent badge:", error.message);
+  }
 }
 
 function textWatchSummary(watch) {
@@ -1029,9 +1125,13 @@ async function resolveExistingSessionContextForTab(tab, pageUrl) {
   return null;
 }
 
-async function ensureSessionContextForTab(tab, pageUrl) {
+async function ensureSessionContextForTab(tab, pageUrl, { createIfMissing = true } = {}) {
   const existing = await resolveExistingSessionContextForTab(tab, pageUrl);
   if (existing) return existing;
+  if (!createIfMissing) {
+    // Lazy: report "no session" rather than provisioning; created on first send.
+    return { session_id: null, binding: null, binding_tab_id: null, grouped: false };
+  }
 
   const label = boundedText(tab.title) || browserOrigin(pageUrl) || "Browser tab";
   return createAndBindBrowserSession(
@@ -1533,6 +1633,7 @@ function notifyAutomationState(feature, tabId = null) {
     broadcastAutomationState().catch((error) => {
       console.warn("[WebBridge] Failed to sync automation state:", error.message);
     });
+    refreshAgentBadge();
   }, 120);
 }
 
@@ -1774,6 +1875,7 @@ async function cmdBatch(params) {
 }
 
 async function handleCommand(msg) {
+  await hydrateSessionState();
   const { request_id, action, params } = msg;
 
   try {
@@ -1857,6 +1959,9 @@ async function runCommand(action, params) {
       case "cookies":
         result = await cmdCookies(params);
         break;
+      case "evaluate":
+        result = await cmdEvaluate(params);
+        break;
       case "inspect":
         result = await cmdInspect(params);
         break;
@@ -1883,6 +1988,9 @@ async function runCommand(action, params) {
         break;
       case "switch_tab":
         result = await cmdSwitchTab(params);
+        break;
+      case "focus_tab":
+        result = await cmdFocusTab(params);
         break;
       case "back":
         result = await cmdBack(params);
@@ -1967,6 +2075,9 @@ async function runCommand(action, params) {
         break;
       case "status":
         result = await cmdStatus();
+        break;
+      case "release_session":
+        result = await cmdReleaseSession(params);
         break;
       case "batch":
         result = await cmdBatch(params);
@@ -2115,7 +2226,21 @@ async function configureSidePanel() {
   await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 }
 
-async function addTabToSessionGroup(parentTab, childTab, sessionId) {
+// Group title: caller label (the agent's action) or the parent page title.
+async function nameSessionGroup(groupId, label, fallbackTitle = "") {
+  if (!chrome.tabGroups?.update || groupId == null) return;
+  const suffix = boundedText(fallbackTitle).slice(0, 24);
+  const title = label
+    ? boundedText(label).slice(0, 40)
+    : (suffix ? `EvoFlux · ${suffix}` : "EvoFlux");
+  await chrome.tabGroups.update(groupId, {
+    title,
+    color: "blue",
+    collapsed: false,
+  });
+}
+
+async function addTabToSessionGroup(parentTab, childTab, sessionId, label = null) {
   if (!chrome.tabs?.group) return null;
   const existingGroupId = Number.isInteger(parentTab.groupId) && parentTab.groupId >= 0
     ? parentTab.groupId
@@ -2129,15 +2254,32 @@ async function addTabToSessionGroup(parentTab, childTab, sessionId) {
   if (existingGroupId != null) {
     await chrome.tabs.group({ tabIds: childTab.id, groupId });
   }
-  if (chrome.tabGroups?.update) {
-    const suffix = boundedText(parentTab.title).slice(0, 24);
-    await chrome.tabGroups.update(groupId, {
-      title: suffix ? `EvoFlux · ${suffix}` : "EvoFlux",
-      color: "blue",
-      collapsed: false,
-    });
-  }
+  if (sessionId != null) trackSessionGroup(sessionId, groupId);
+  await nameSessionGroup(groupId, label, parentTab.title);
   return groupId;
+}
+
+async function ensureSessionGroup(sessionId, tab, label = null) {
+  if (!chrome.tabs?.group) return null;
+  const key = String(sessionId);
+  const existing = sessionGroupIds.get(key);
+  if (existing != null) {
+    try {
+      await chrome.tabs.group({ tabIds: tab.id, groupId: existing });
+      // Tab title as fallback so a missing label never yields a bare "EvoFlux".
+      await nameSessionGroup(existing, label, tab.title);
+      return existing;
+    } catch {
+      untrackSessionGroup(key); // group was closed by the user; start fresh
+    }
+  }
+  const fresh = await chrome.tabs.group({
+    tabIds: [tab.id],
+    createProperties: { windowId: tab.windowId },
+  });
+  trackSessionGroup(key, fresh);
+  await nameSessionGroup(fresh, label, tab.title);
+  return fresh;
 }
 
 async function withSessionGroupLock(sessionId, operation) {
@@ -2155,7 +2297,7 @@ async function withSessionGroupLock(sessionId, operation) {
   }
 }
 
-async function createGroupedSessionTab(parentTab, sessionId, { url = "chrome://newtab/", active = false } = {}) {
+async function createGroupedSessionTab(parentTab, sessionId, { url = "chrome://newtab/", active = false, label = null } = {}) {
   if (!parentTab || parentTab.id == null) throw new Error("The session has no primary browser tab.");
   const childTab = await chrome.tabs.create({
     url,
@@ -2166,7 +2308,7 @@ async function createGroupedSessionTab(parentTab, sessionId, { url = "chrome://n
   });
   const groupId = await withSessionGroupLock(sessionId, async () => {
     const currentParent = await chrome.tabs.get(parentTab.id);
-    return addTabToSessionGroup(currentParent, childTab, sessionId);
+    return addTabToSessionGroup(currentParent, childTab, sessionId, label);
   });
   await broadcastTabInfo();
   return { success: true, tab_id: childTab.id, group_id: groupId, url };
@@ -2452,9 +2594,35 @@ async function capturePanelContext(tab, kind) {
   };
 }
 
-// Resolve the tab a command targets: an explicit params.tab_id (so a session
-// can pin a tab and stay deterministic even if the user switches tabs), else
-// the active tab.
+// ── Target-audit ring ────────────────────────────────────────────
+// Bounded ring in chrome.storage.session recording target:"active" uses and
+// focus_tab calls; pruned by count/TTL on write. Session-lifetime only.
+const TARGET_AUDIT_STORAGE_KEY = "webbridgeTargetAuditTrail";
+const TARGET_AUDIT_MAX = 50;
+const TARGET_AUDIT_TTL_MS = 4320 * 60 * 1000; // 30 days, same bound as the GPT ring (@167201)
+let targetAuditWriteChain = Promise.resolve();
+
+async function recordTargetAudit(entry) {
+  // One promise chain so concurrent commands cannot interleave ring writes.
+  targetAuditWriteChain = targetAuditWriteChain.catch(() => {}).then(async () => {
+    try {
+      const storage = chrome.storage.session || chrome.storage.local;
+      const now = Date.now();
+      const data = await storage.get(TARGET_AUDIT_STORAGE_KEY).catch(() => ({}));
+      const trail = (Array.isArray(data[TARGET_AUDIT_STORAGE_KEY]) ? data[TARGET_AUDIT_STORAGE_KEY] : [])
+        .filter((e) => e && typeof e.at === "number" && now - e.at < TARGET_AUDIT_TTL_MS);
+      trail.push({ ...entry, at: now });
+      await storage.set({ [TARGET_AUDIT_STORAGE_KEY]: trail.slice(-TARGET_AUDIT_MAX) });
+    } catch (error) {
+      console.warn("[WebBridge] Audit entry unavailable:", error.message);
+    }
+  });
+  return targetAuditWriteChain;
+}
+
+// Resolve a command's target tab, fail-closed: explicit params.tab_id, or the
+// audited params.target === "active" escape hatch. Never fall back to the tab
+// the user happens to be reading.
 async function resolveTab(params) {
   let tab;
   if (params && params.tab_id != null) {
@@ -2463,9 +2631,19 @@ async function resolveTab(params) {
     } catch {
       throw new Error(`Tab ${params.tab_id} not found`);
     }
-  } else {
+  } else if (params && params.target === "active") {
     tab = await getActiveTab();
     if (!tab) throw new Error("No active tab");
+    await recordTargetAudit({
+      event: "target_active_escape_hatch",
+      tab_id: tab.id,
+      window_id: tab.windowId,
+      url: boundedText(tab.url || tab.pendingUrl || "").slice(0, 300),
+    });
+  } else {
+    throw new Error(
+      "UNBOUND_TARGET: no tab_id and no session binding for this command; refusing active-tab fallback. Pass tab_id (from get_tabs/switch_tab), or deliberately target the user's current tab with target:\"active\".",
+    );
   }
   if (await humanLeaseForTab(tab)) {
     throw new Error("Human control is active for this tab. Wait for the user to resume the agent.");
@@ -2571,7 +2749,7 @@ function humanPointerPath(from, to, preferredSteps = null) {
 async function setAgentControlOverlay(tabId, enabled, pointer = null) {
   if (tabId == null) return false;
   if (!enabled) {
-    agentControlOverlays.delete(tabId);
+    untrackOverlayTab(tabId);
     overlayCaptureSuspensions.delete(tabId);
     agentPointerPositions.delete(tabId);
     try {
@@ -2582,6 +2760,7 @@ async function setAgentControlOverlay(tabId, enabled, pointer = null) {
     } catch {
       // Restricted pages and navigations may remove the content script first.
     }
+    refreshAgentBadge();
     return false;
   }
 
@@ -2609,10 +2788,11 @@ async function setAgentControlOverlay(tabId, enabled, pointer = null) {
         y: response.pointer.y,
       });
     }
-    agentControlOverlays.add(tabId);
+    trackOverlayTab(tabId);
+    refreshAgentBadge();
     return true;
   } catch (error) {
-    agentControlOverlays.delete(tabId);
+    untrackOverlayTab(tabId);
     agentPointerPositions.delete(tabId);
     console.warn("[WebBridge] Could not show the control overlay:", error.message);
     return false;
@@ -2733,22 +2913,39 @@ async function sendCommandResilient(tabId, method, params, attachOptions = {}) {
   }
 }
 
+// True when a human can see this tab. The glide/overlay motion exists for a
+// watcher; on a hidden tab it is only extra messages that can stall the command.
+async function tabIsFrontmost(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!tab || tab.active === false) return false;
+    if (tab.windowId == null || typeof chrome.windows?.get !== "function") return true;
+    const win = await chrome.windows.get(tab.windowId);
+    return !!win && win.state !== "minimized";
+  } catch {
+    return false;
+  }
+}
+
 async function dispatchHumanPointerMove(tabId, target, eventParams = {}) {
   const from = agentPointerPositions.get(tabId);
+  const watching = await tabIsFrontmost(tabId);
   // The glide is there so a person watching can follow the agent. With
   // "instant" motion one mouseMoved still lands on the target (hover state,
   // the overlay cursor), without the 72–360 ms path and its per-step messages.
-  const points = from && agentPointerMotion.get(tabId) !== "instant"
+  const points = watching && from && agentPointerMotion.get(tabId) !== "instant"
     ? humanPointerPath(from, target)
     : [{ x: target.x, y: target.y, delayMs: 0 }];
   let result;
   for (let index = 0; index < points.length; index++) {
     const point = points[index];
-    await setAgentControlOverlay(tabId, true, {
-      x: point.x,
-      y: point.y,
-      phase: eventParams.buttons ? "drag" : "move",
-    });
+    if (watching) {
+      await setAgentControlOverlay(tabId, true, {
+        x: point.x,
+        y: point.y,
+        phase: eventParams.buttons ? "drag" : "move",
+      });
+    }
     result = await sendCommandResilient(tabId, "Input.dispatchMouseEvent", {
       type: "mouseMoved",
       x: point.x,
@@ -2758,11 +2955,11 @@ async function dispatchHumanPointerMove(tabId, target, eventParams = {}) {
       ...(eventParams.modifiers ? { modifiers: eventParams.modifiers } : {}),
     });
     agentPointerPositions.set(tabId, { x: point.x, y: point.y });
-    if (index < points.length - 1 && point.delayMs > 0) {
+    if (watching && index < points.length - 1 && point.delayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, Math.max(8, point.delayMs)));
     }
   }
-  if (points.length > 1) {
+  if (watching && points.length > 1) {
     // Let the overlay's short interpolation settle on the same coordinate
     // before a following press, matching the page's final mouseMoved event.
     await new Promise((resolve) => setTimeout(resolve, 28));
@@ -2786,7 +2983,7 @@ async function cdpSend(tabId, method, params = {}, attachOptions = {}) {
       await dispatchHumanPointerMove(tabId, { x: params.x, y: params.y });
     }
   }
-  if (pointerEvent) {
+  if (pointerEvent && (await tabIsFrontmost(tabId))) {
     await setAgentControlOverlay(tabId, true, {
       x: params.x,
       y: params.y,
@@ -4177,6 +4374,23 @@ function inspectInPage(el, properties) {
   };
 }
 
+// Run an agent-provided script in the page; Runtime.evaluate services it even
+// when the tab is not in front. The race stops a frozen tab eating the timeout.
+async function cmdEvaluate(params) {
+  const tab = await resolveTab(params);
+  const script = String(params?.script ?? "");
+  if (!script.trim()) throw new Error("evaluate requires a script");
+  const awaitPromise = params?.await_promise !== false;
+  const requested = Number(params?.timeout_ms);
+  // Answer slightly before the outer command race so the precise message wins.
+  const budget = Math.max(
+    1000,
+    (Number.isFinite(requested) && requested > 0 ? Math.min(requested, 60000) : 30000) - 2000,
+  );
+  const value = await raceTimeout(evalInPage(tab.id, script, awaitPromise), budget, "evaluate");
+  return { success: true, value: value === undefined ? null : value };
+}
+
 async function cmdInspect(params) {
   const tab = await resolveTab(params);
   const spec = targetSpec(params);
@@ -4606,10 +4820,11 @@ chrome.debugger.onDetach.addListener((source) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   attachedTabs.delete(tabId);
-  agentControlOverlays.delete(tabId);
+  untrackOverlayTab(tabId);
   overlayCaptureSuspensions.delete(tabId);
   agentPointerPositions.delete(tabId);
   agentPointerMotion.delete(tabId);
+  refreshAgentBadge();
   networkInflight.delete(tabId);
   diagnosticCaptures.delete(tabId);
   devtoolsLogs.delete(tabId);
@@ -4848,22 +5063,83 @@ async function cmdKey(params) {
   return { success: true, key, modifiers };
 }
 
+// Bounded race for anything that talks to a renderer: a tab nobody is looking
+// at (hidden, occluded, or frozen) can simply never ack, and the 60s outer
+// command timeout is far too long for the agent to sit through each time.
+function raceTimeout(promise, ms, label) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
 async function cmdScroll(params) {
   const tab = await resolveTab(params);
+  const dx = Number(params.dx) || 0;
+  const dy = Number(params.dy) || 0;
 
-  const { dx = 0, dy = 0 } = params;
+  // Race the real wheel (wheel-listening pages need it), then fall back to
+  // window.scrollBy on the page's main thread — a hidden tab can swallow input.
+  await ensureDebuggerAttached(tab.id, { showControl: false });
 
-  // Use CDP Input.dispatchMouseEvent for scroll
-  // Scroll events use mouseWheel with deltaX/deltaY
-  await cdpSend(tab.id, "Input.dispatchMouseEvent", {
-    type: "mouseWheel",
-    x: 0,
-    y: 0,
-    deltaX: dx,
-    deltaY: dy,
-  });
+  const readScrollY = async () => {
+    const value = await raceTimeout(
+      evalInPage(tab.id, "Math.round(window.scrollY) || 0"),
+      3000,
+      "scroll position read",
+    );
+    return typeof value === "number" ? value : null;
+  };
 
-  return { success: true, dx, dy };
+  const before = await readScrollY().catch(() => null);
+  let path = "cdp_wheel";
+  try {
+    await raceTimeout(
+      sendCommandResilient(tab.id, "Input.dispatchMouseEvent", {
+        type: "mouseWheel",
+        x: 0,
+        y: 0,
+        deltaX: dx,
+        deltaY: dy,
+      }),
+      2500,
+      "wheel dispatch",
+    );
+  } catch (error) {
+    console.warn("[WebBridge] CDP wheel unavailable, using programmatic scroll:", error.message);
+    path = "programmatic";
+  }
+
+  let after = before === null ? null : await readScrollY().catch(() => null);
+  if (before !== null && after === before && (dx || dy)) {
+    path = "programmatic";
+  }
+  if (path === "programmatic") {
+    try {
+      await raceTimeout(
+        evalInPage(tab.id, `window.scrollBy(${dx}, ${dy})`),
+        4000,
+        "programmatic scroll",
+      );
+      if (before !== null) after = await readScrollY().catch(() => after);
+    } catch (error) {
+      throw new Error(
+        `Scroll failed: the tab did not respond (${error.message}). ` +
+          "Bring the tab to the foreground and retry.",
+      );
+    }
+  }
+
+  return {
+    success: true,
+    dx,
+    dy,
+    path,
+    scroll_y_before: before,
+    scroll_y_after: after,
+    moved: before === null || after === null ? null : after !== before,
+  };
 }
 
 async function getViewportMetrics(tabId) {
@@ -4963,7 +5239,12 @@ async function cmdScreenshot(params) {
   const { format = "png", quality = 80, full_page = false } = params || {};
   const fmt = format === "jpeg" ? "jpeg" : "png";
 
-  const vp = await getViewportMetrics(tab.id);
+  const screenshotHint =
+    " A frozen background tab can stop answering - bring the tab to the foreground and retry.";
+  const vp = await raceTimeout(getViewportMetrics(tab.id), 8000, "screenshot viewport read")
+    .catch((error) => {
+      throw new Error(`Screenshot failed: ${error.message}.${screenshotHint}`);
+    });
 
   // clip.scale = 1 makes 1 image pixel == 1 CSS pixel regardless of the
   // display's devicePixelRatio, so click coordinates the model reads off the
@@ -4979,15 +5260,24 @@ async function cmdScreenshot(params) {
     clip = { x: vp.scrollX, y: vp.scrollY, width: vp.width, height: vp.height, scale: 1 };
   }
 
-  const result = await captureWithoutAgentControlOverlay(tab.id, () => (
-    cdpSend(tab.id, "Page.captureScreenshot", {
-      format: fmt,
-      quality: fmt === "jpeg" ? quality : undefined,
-      clip,
-      captureBeyondViewport: true,
-      fromSurface: true,
-    })
-  ));
+  // The clip is page-coordinate and rendered fresh (captureBeyondViewport), so
+  // the image shows the page as JS left it - not the stale on-screen surface -
+  // even when the tab is hidden behind the user's other work.
+  const result = await raceTimeout(
+    captureWithoutAgentControlOverlay(tab.id, () => (
+      cdpSend(tab.id, "Page.captureScreenshot", {
+        format: fmt,
+        quality: fmt === "jpeg" ? quality : undefined,
+        clip,
+        captureBeyondViewport: true,
+        fromSurface: true,
+      })
+    )),
+    20000,
+    "screenshot capture",
+  ).catch((error) => {
+    throw new Error(`Screenshot failed: ${error.message}.${screenshotHint}`);
+  });
 
   return {
     success: true,
@@ -5205,9 +5495,12 @@ async function cmdScrollToBottom(params) {
   const spec = targetSpec(params);
   if (spec) await ensureRuntime(tab.id);
   const SCROLLER = spec ? elementExpr(spec) : "null";
-  const result = await evalInPage(
-    tab.id,
-    `(async () => {
+  // Page timers can stall when the tab is hidden or frozen; answer inside a
+  // deadline instead of letting the 60s command timeout run out with nothing.
+  const result = await raceTimeout(
+    evalInPage(
+      tab.id,
+      `(async () => {
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       const pane = ${SCROLLER};
       const doc = document.documentElement;
@@ -5226,7 +5519,10 @@ async function cmdScrollToBottom(params) {
       const seen = pane ? pane.clientHeight + pane.scrollTop : innerHeight + scrollY;
       return { scrolls, final_height: height(), at_bottom: seen >= height() - 4 };
     })()`,
-    true
+      true,
+    ),
+    delay * max + 8000,
+    "scroll_to_bottom",
   );
   return { success: true, ...(result || {}) };
 }
@@ -5239,6 +5535,7 @@ async function cmdGetTabs() {
   };
 }
 
+// switch_tab re-targets without focusing; taking focus is focus_tab's job.
 async function cmdSwitchTab(params) {
   const { index, id } = params;
 
@@ -5249,8 +5546,6 @@ async function cmdSwitchTab(params) {
     if (await humanLeaseForWindow(tab.windowId)) {
       throw new Error("Human control is active in this window. Wait for the user to resume the agent.");
     }
-    await chrome.tabs.update(id, { active: true });
-    await chrome.windows.update(tab.windowId, { focused: true });
     if (browserOrigin(tab.url || tab.pendingUrl || "")) await ensureDebuggerAttached(tab.id);
     await broadcastTabInfo();
     return { success: true, tab_id: id };
@@ -5262,8 +5557,6 @@ async function cmdSwitchTab(params) {
     if (await humanLeaseForWindow(tab.windowId)) {
       throw new Error("Human control is active in this window. Wait for the user to resume the agent.");
     }
-    await chrome.tabs.update(tab.id, { active: true });
-    await chrome.windows.update(tab.windowId, { focused: true });
     if (browserOrigin(tab.url || tab.pendingUrl || "")) await ensureDebuggerAttached(tab.id);
     await broadcastTabInfo();
     return { success: true, tab_id: tab.id };
@@ -5272,10 +5565,37 @@ async function cmdSwitchTab(params) {
   throw new Error(`Tab index ${index} out of range`);
 }
 
+// focus_tab is the only place the extension takes focus: validate id, respect
+// the human-lease guard, focus tab+window, record in the audit ring.
+async function cmdFocusTab(params) {
+  const tabId = params?.tab_id;
+  if (!Number.isSafeInteger(tabId) || tabId <= 0) {
+    throw new Error("focus_tab requires params.tab_id, a positive integer tab id.");
+  }
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    throw new Error(`Tab ${tabId} not found`);
+  }
+  if (await humanLeaseForWindow(tab.windowId)) {
+    throw new Error("Human control is active in this window. Wait for the user to resume the agent.");
+  }
+  await chrome.tabs.update(tabId, { active: true });
+  await chrome.windows.update(tab.windowId, { focused: true });
+  await recordTargetAudit({ event: "focus_tab", tab_id: tabId, window_id: tab.windowId });
+  return { success: true, tab_id: tabId, focused: true };
+}
+
+// open_tab defaults to background (`focus`, default false); legacy `active` is
+// deliberately unread — its old true default would restore focus stealing.
 async function cmdOpenTab(params) {
-  const { url, active = true } = params;
+  const { url, focus = false } = params;
   if (!url) throw new Error("open_tab requires a url");
-  if (active) {
+  const label = typeof params._webbridge_group_label === "string" && params._webbridge_group_label.trim()
+    ? boundedText(params._webbridge_group_label).slice(0, 40)
+    : null;
+  if (focus) {
     const current = await getActiveTab();
     if (current && await humanLeaseForWindow(current.windowId)) {
       throw new Error("Human control is active in this window. Open the tab in background or wait for the user to resume the agent.");
@@ -5284,11 +5604,17 @@ async function cmdOpenTab(params) {
   const parentTabId = params._webbridge_parent_tab_id;
   if (parentTabId != null) {
     const parentTab = await chrome.tabs.get(parentTabId);
-    return createGroupedSessionTab(parentTab, params._webbridge_session_id, { url, active });
+    return createGroupedSessionTab(parentTab, params._webbridge_session_id, { url, active: focus, label });
   }
-  const tab = await chrome.tabs.create({ url, active });
+  const tab = await chrome.tabs.create({ url, active: focus });
+  // No bound primary yet — group it anyway so open_tab-first sessions get a group.
+  let groupId = null;
+  if (params._webbridge_session_id != null) {
+    groupId = await withSessionGroupLock(params._webbridge_session_id, () =>
+      ensureSessionGroup(params._webbridge_session_id, tab, label));
+  }
   await broadcastTabInfo();
-  return { success: true, tab_id: tab.id, url };
+  return { success: true, tab_id: tab.id, group_id: groupId, url };
 }
 
 async function cmdCloseTab(params) {
@@ -6032,6 +6358,48 @@ async function cmdSnapshot(params) {
   return { success: true, ...snapshot, elements: snapshot.elements || [] };
 }
 
+// release_session: browsing session over — close the session's grouped tabs,
+// clear their overlays/bindings, refresh the badge. No id = all groups.
+async function cmdReleaseSession(params = {}) {
+  const targetSession = params._webbridge_session_id || params.session_id || null;
+  const keys = targetSession != null
+    ? [String(targetSession)]
+    : [...sessionGroupIds.keys()];
+  const closed = [];
+  for (const key of keys) {
+    const groupId = sessionGroupIds.get(key);
+    if (groupId == null) continue;
+    let groupTabs = [];
+    try {
+      groupTabs = await chrome.tabs.query({ groupId });
+    } catch {
+      groupTabs = [];
+    }
+    for (const tab of groupTabs) {
+      await setAgentControlOverlay(tab.id, false).catch(() => {});
+      await clearPickedElement(tab.id).catch(() => {});
+    }
+    const tabIds = groupTabs.map((t) => t.id).filter((id) => Number.isInteger(id));
+    if (tabIds.length) {
+      try {
+        await chrome.tabs.remove(tabIds);
+        closed.push(...tabIds);
+      } catch {
+        // Some tabs may already be gone (user closed them) — keep going.
+      }
+    }
+    untrackSessionGroup(key);
+  }
+  if (targetSession == null) {
+    for (const tabId of [...agentControlOverlays]) {
+      await setAgentControlOverlay(tabId, false).catch(() => {});
+    }
+  }
+  refreshAgentBadge();
+  await broadcastTabInfo();
+  return { success: true, closed_tabs: closed, released_sessions: keys.length };
+}
+
 async function cmdStatus() {
   const tab = await getActiveTab();
   return {
@@ -6090,10 +6458,11 @@ async function broadcastTabInfo() {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "loading") {
     // The old document (and its injected overlay) is being replaced.
-    agentControlOverlays.delete(tabId);
+    untrackOverlayTab(tabId);
     overlayCaptureSuspensions.delete(tabId);
     agentPointerPositions.delete(tabId);
     activePageDialogs.delete(tabId);
+    refreshAgentBadge();
   }
   if (changeInfo.url || changeInfo.status === "loading") {
     rotateTabPageInstance(tabId).catch((error) => {
@@ -6551,7 +6920,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const tab = await getActiveTab();
         if (!tab || tab.id == null) throw new Error("No active tab");
         const pageUrl = tab.url || tab.pendingUrl || "";
-        const context = await ensureSessionContextForTab(tab, pageUrl);
+        const context = await ensureSessionContextForTab(tab, pageUrl, {
+          createIfMissing: msg.create_if_missing !== false,
+        });
         sendResponse({
           ok: true,
           ...context,
@@ -6733,4 +7104,5 @@ configureSidePanel().catch((e) => {
 });
 
 console.log("[WebBridge] Extension loaded, connecting...");
+  hydrateSessionState();
 connect();

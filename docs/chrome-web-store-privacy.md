@@ -57,7 +57,7 @@ The sidePanel permission provides the EvoFlux Side Chat, connection status, brow
 ### storage
 
 ```text
-The storage permission keeps local extension settings and operational state, including the discovered local endpoint, scoped connection state, appearance preferences, tab/session bindings, editable drafts, text watches, teach-mode drafts, and temporary handoff state. This allows the extension to recover safely after service-worker suspension or browser restart.
+The storage permission keeps local extension settings and operational state, including the discovered local endpoint, scoped connection state, appearance preferences, tab/session bindings, editable drafts, text watches, teach-mode drafts, and temporary handoff state. This allows the extension to recover safely after service-worker suspension or browser restart. It also keeps a bounded target-audit trail (the most recent 50 entries, pruned after 30 days) in session storage, recording when an agent explicitly focuses a tab or deliberately targets the tab the user is viewing; session storage is cleared when the browser session ends.
 ```
 
 ### tabGroups
