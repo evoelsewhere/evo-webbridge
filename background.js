@@ -2931,8 +2931,8 @@ async function dispatchHumanPointerMove(tabId, target, eventParams = {}) {
   const from = agentPointerPositions.get(tabId);
   const watching = await tabIsFrontmost(tabId);
   // The glide is there so a person watching can follow the agent. With
-  // "instant" motion one mouseMoved still lands on the target (hover state,
-  // the overlay cursor), without the 72–360 ms path and its per-step messages.
+  // "instant" motion sends one mouseMoved to the target; the overlay glides
+  // there locally without the 72–360 ms path and its per-step messages.
   const points = watching && from && agentPointerMotion.get(tabId) !== "instant"
     ? humanPointerPath(from, target)
     : [{ x: target.x, y: target.y, delayMs: 0 }];
@@ -2944,6 +2944,7 @@ async function dispatchHumanPointerMove(tabId, target, eventParams = {}) {
         x: point.x,
         y: point.y,
         phase: eventParams.buttons ? "drag" : "move",
+        motion: agentPointerMotion.get(tabId) || "human",
       });
     }
     result = await sendCommandResilient(tabId, "Input.dispatchMouseEvent", {

@@ -21,19 +21,27 @@
   let lastY = null;
   let pulseTimer = null;
 
+  function promoteOverlay() {
+    if (!host || typeof host.showPopover !== "function") return;
+    if (host.matches(":popover-open")) host.hidePopover();
+    host.showPopover();
+  }
+
   function mount() {
     if (host?.isConnected) return;
     host = document.getElementById(HOST_ID);
     if (host) {
       cursor = host.shadowRoot?.querySelector(".cursor") || null;
       cursorPulse = host.shadowRoot?.querySelector(".cursor-pulse") || null;
+      promoteOverlay();
       return;
     }
 
     host = document.createElement("div");
     host.id = HOST_ID;
     host.setAttribute("aria-hidden", "true");
-    host.style.cssText = "all:initial;position:fixed;inset:0;pointer-events:none;z-index:2147483647;contain:layout style;";
+    host.setAttribute("popover", "manual");
+    host.style.cssText = "all:initial;position:fixed;inset:0;width:100%;height:100%;margin:0;padding:0;border:0;background:transparent;overflow:visible;pointer-events:none;z-index:2147483647;contain:layout style;";
     const root = host.attachShadow({ mode: "open" });
     root.innerHTML = `
       <style>
@@ -58,7 +66,7 @@
           position: absolute; left: 0; top: 0; width: 14.22px; height: 16px;
           transform: translate3d(var(--cursor-x, 72vw), var(--cursor-y, 34vh), 0);
           transform-origin: 2.37px 1.6px;
-          transition: transform 28ms linear;
+          transition: transform var(--cursor-duration, 28ms) cubic-bezier(.22,1,.36,1);
           will-change: transform;
         }
         .cursor-aura {
@@ -78,7 +86,7 @@
           position: absolute; left: -3px; top: -3px; width: 10px; height: 10px;
           border: 1.5px solid rgba(126,102,255,.86); box-shadow: 0 0 8px rgba(70,211,255,.72); border-radius: 50%; opacity: 0; transform: scale(.25);
         }
-        .cursor.pressed { transform: translate3d(var(--cursor-x), var(--cursor-y), 0) scale(.9); transition-duration: 55ms; }
+        .cursor.pressed { transform: translate3d(var(--cursor-x), var(--cursor-y), 0) scale(.9); }
         .cursor.pressed .cursor-aura { opacity: .78; filter: blur(2px); }
         .cursor.pulsing .cursor-pulse { animation: evoflux-click .42s ease-out; }
         @keyframes evoflux-frame-bloom {
@@ -123,6 +131,7 @@
     cursor.style.setProperty("--cursor-x", `${lastX - TIP_X}px`);
     cursor.style.setProperty("--cursor-y", `${lastY - TIP_Y}px`);
     (document.documentElement || document).appendChild(host);
+    promoteOverlay();
     host.style.visibility = suspended ? "hidden" : "visible";
   }
 
@@ -135,8 +144,16 @@
     cursorPulse = null;
   }
 
-  function movePointer(x, y, phase = "move") {
+  function movePointer(x, y, phase = "move", motion = "human") {
     if (!cursor || !Number.isFinite(x) || !Number.isFinite(y)) return;
+    promoteOverlay();
+    const distance = lastX == null || lastY == null ? 0 : Math.hypot(x - lastX, y - lastY);
+    if (distance >= 1) {
+      const duration = motion === "instant"
+        ? Math.max(28, Math.min(220, Math.round(distance * 0.7)))
+        : 28;
+      cursor.style.setProperty("--cursor-duration", `${duration}ms`);
+    }
     lastX = Math.max(0, Math.min(innerWidth - 1, x));
     lastY = Math.max(0, Math.min(innerHeight - 1, y));
     // The SVG pointer tip is at (4, 2.7); offset the visual so its tip is the
@@ -177,7 +194,12 @@
     if (typeof message.enabled === "boolean") setEnabled(message.enabled);
     if (typeof message.suspended === "boolean") setSuspended(message.suspended);
     if (enabled && message.pointer) {
-      movePointer(Number(message.pointer.x), Number(message.pointer.y), message.pointer.phase);
+      movePointer(
+        Number(message.pointer.x),
+        Number(message.pointer.y),
+        message.pointer.phase,
+        message.pointer.motion,
+      );
     }
     sendResponse({
       ok: true,
