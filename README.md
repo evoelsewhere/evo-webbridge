@@ -45,7 +45,13 @@ Chrome DevTools Protocol (`chrome.debugger`):
 - **JavaScript dialogs** — dialogs reports active/recent alert, confirm, and
   prompt state; handle_dialog accepts or dismisses the native dialog. Side Chat
   mirrors an active dialog in its AskUser-style question surface so the user can
-  respond when the agent hands control back.
+  respond when the agent hands control back. When a dialog blocks input or
+  evaluation, the command returns `JAVASCRIPT_DIALOG_OPEN` with its message
+  instead of waiting for a timeout. The triggering action may already have run;
+  handle the dialog before continuing rather than repeating that action.
+  Native dialog buttons are browser UI and cannot be clicked with page
+  coordinates. Use `handle_dialog {accept: true}` for an alert, or explicitly
+  accept/cancel a confirm or prompt (`prompt_text` supplies the prompt value).
 - **Reading** — screenshot (viewport or full_page, at CSS-pixel scale),
   extract (text/Markdown/HTML), and extract_elements (structured records).
 - **Semantic productivity surfaces** — semantic_snapshot/read/select/write use

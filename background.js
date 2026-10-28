@@ -83,6 +83,7 @@ const agentPointerPositions = new Map();
 const agentPointerMotion = new Map();
 const activePageDialogs = new Map();
 const pageDialogHistory = new Map();
+const pageDialogWaiters = new Map(); // tabId -> pending renderer operations
 // --- session state persisted across MV3 service-worker restarts ---
 // The SW dies after ~30s idle; unpersisted, release_session finds no groups
 // and the badge reads an empty overlay set. Hydrated on every SW wake.
@@ -2623,7 +2624,7 @@ async function recordTargetAudit(entry) {
 // Resolve a command's target tab, fail-closed: explicit params.tab_id, or the
 // audited params.target === "active" escape hatch. Never fall back to the tab
 // the user happens to be reading.
-async function resolveTab(params) {
+async function resolveTab(params, { allowDialog = false } = {}) {
   let tab;
   if (params && params.tab_id != null) {
     try {
@@ -2659,10 +2660,12 @@ async function resolveTab(params) {
   ) {
     throw new Error("Bound browser tab changed origin; bind this tab again before continuing.");
   }
+  if (!allowDialog) throwIfPageDialog(tab.id);
   // A Coding session records console and network from its first command, so
   // the load it is about to trigger is already in the log when it asks.
   if (
     params?._webbridge_devtools === "capture" &&
+    !activePageDialogs.has(tab.id) &&
     !devtoolsLogs.has(tab.id) &&
     browserOrigin(tab.url || tab.pendingUrl || "")
   ) {
@@ -2767,16 +2770,16 @@ async function setAgentControlOverlay(tabId, enabled, pointer = null) {
   try {
     if (agentControlOverlays.has(tabId) && !pointer) return true;
     if (!agentControlOverlays.has(tabId)) {
-      await chrome.scripting.executeScript({
+      await withPageDialogGuard(tabId, () => chrome.scripting.executeScript({
         target: { tabId, frameIds: [0] },
         files: ["agent_control_overlay.js"],
-      });
+      }));
     }
-    const response = await chrome.tabs.sendMessage(tabId, {
+    const response = await withPageDialogGuard(tabId, () => chrome.tabs.sendMessage(tabId, {
       type: "webbridge_agent_control",
       enabled: true,
       pointer,
-    });
+    }));
     if (response?.ok === false) throw new Error("Control overlay rejected the update");
     if (
       !agentPointerPositions.has(tabId) &&
@@ -2792,6 +2795,7 @@ async function setAgentControlOverlay(tabId, enabled, pointer = null) {
     refreshAgentBadge();
     return true;
   } catch (error) {
+    if (error.code === "JAVASCRIPT_DIALOG_OPEN") throw error;
     untrackOverlayTab(tabId);
     agentPointerPositions.delete(tabId);
     console.warn("[WebBridge] Could not show the control overlay:", error.message);
@@ -2890,8 +2894,47 @@ async function detachAllDebuggers() {
   return tabIds;
 }
 
+function pageDialogError(dialog) {
+  const error = new Error(
+    `JAVASCRIPT_DIALOG_OPEN: browser ${dialog.type} in tab ${dialog.tab_id}: ` +
+    `${JSON.stringify(dialog.message)}. The action may already have run. ` +
+    "Use dialogs and handle_dialog before continuing; native browser dialogs cannot be clicked with page coordinates.",
+  );
+  error.code = "JAVASCRIPT_DIALOG_OPEN";
+  return error;
+}
+
+function throwIfPageDialog(tabId) {
+  const dialog = activePageDialogs.get(tabId);
+  if (dialog) throw pageDialogError(dialog);
+}
+
+// Native modal UI pauses the renderer, including CDP input/evaluation replies
+// and overlay content-script messages. Unblock the caller on the dialog event
+// so it can issue handle_dialog instead of waiting for the command timeout.
+async function withPageDialogGuard(tabId, operation) {
+  throwIfPageDialog(tabId);
+  const waiters = pageDialogWaiters.get(tabId) || new Set();
+  pageDialogWaiters.set(tabId, waiters);
+  let rejectDialog;
+  const interrupted = new Promise((_, reject) => { rejectDialog = reject; });
+  waiters.add(rejectDialog);
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => {
+        throwIfPageDialog(tabId);
+        return operation();
+      }),
+      interrupted,
+    ]);
+  } finally {
+    waiters.delete(rejectDialog);
+    if (!waiters.size) pageDialogWaiters.delete(tabId);
+  }
+}
+
 function sendCommandOnce(tabId, method, params) {
-  return new Promise((resolve, reject) => {
+  const send = () => new Promise((resolve, reject) => {
     chrome.debugger.sendCommand({ tabId }, method, params, (result) => {
       if (chrome.runtime.lastError) {
         reject(new Error(chrome.runtime.lastError.message));
@@ -2900,6 +2943,9 @@ function sendCommandOnce(tabId, method, params) {
       }
     });
   });
+  return /^(Input|Runtime)\./.test(method)
+    ? withPageDialogGuard(tabId, send)
+    : send();
 }
 
 async function sendCommandResilient(tabId, method, params, attachOptions = {}) {
@@ -2969,6 +3015,7 @@ async function dispatchHumanPointerMove(tabId, target, eventParams = {}) {
 }
 
 async function cdpSend(tabId, method, params = {}, attachOptions = {}) {
+  throwIfPageDialog(tabId);
   await ensureDebuggerAttached(tabId, attachOptions);
 
   const pointerEvent =
@@ -4726,6 +4773,9 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       active: true,
     };
     activePageDialogs.set(tabId, dialog);
+    for (const reject of pageDialogWaiters.get(tabId) || []) {
+      reject(pageDialogError(dialog));
+    }
     history.push(dialog);
     if (history.length > 100) history.splice(0, history.length - 100);
     pageDialogHistory.set(tabId, history);
@@ -5210,7 +5260,7 @@ async function cmdResetViewport(params) {
 }
 
 async function cmdDialogs(params) {
-  const tab = await resolveTab(params);
+  const tab = await resolveTab(params, { allowDialog: true });
   const limit = Math.max(1, Math.min(100, Number(params?.limit) || 20));
   const history = (pageDialogHistory.get(tab.id) || []).slice(-limit);
   const active = activePageDialogs.get(tab.id) || null;
@@ -5219,7 +5269,7 @@ async function cmdDialogs(params) {
 }
 
 async function cmdHandleDialog(params) {
-  const tab = await resolveTab(params);
+  const tab = await resolveTab(params, { allowDialog: true });
   return handlePageDialogForTab(tab.id, params);
 }
 
