@@ -146,8 +146,8 @@ one-time credentials setup and release procedure.
 
 EvoFlux Desktop installs a Chrome/Edge Native Messaging host and publishes the
 current ephemeral sidecar port to it. WebBridge asks that host for the running
-app endpoint whenever it starts or reconnects, so there is no URL to copy or
-paste. The native host shares only a process-scoped WebBridge discovery token;
+app endpoint whenever it starts or reconnects. You can select a different local
+instance in Side Chat settings. The native host shares only a process-scoped WebBridge discovery token;
 it never exposes the desktop bearer token.
 
 For a local desktop connection, the extension establishes its scoped internal
@@ -157,11 +157,20 @@ token, and the exact stable extension ID.
 
 ## Side Chat settings
 
-- **Discovered desktop endpoint** — read-only status for the current bundled
-  sidecar address. WebBridge does not accept a manually pasted relay URL.
+- **EvoFlux endpoint** — enter a local `http://127.0.0.1:PORT` or
+  `ws://localhost:PORT` address, then choose **Save & reconnect**. The saved
+  address wins over automatic discovery. **Use automatic** restores discovery.
+  Switching addresses clears the current connection credential and Side Chat
+  selection, then pairs with the selected instance.
+- Desktop instances publish separate process-scoped discovery records. The native
+  host selects the record matching the saved endpoint, even when other Desktop
+  apps with different identifiers are running. Participating Desktop builds need
+  this multi-instance support and one restart after updating. A standalone local backend can supply its token
+  directly. A protected endpoint that cannot authorize discovery shows an error;
+  WebBridge never falls back to a different instance.
 
-The discovered address is cached in `chrome.storage.local` and refreshed from
-Native Messaging before every connection. The internal connection credential
+The endpoint override is saved in `chrome.storage.local`. Without an override,
+the discovered address is refreshed from Native Messaging before every connection. The internal connection credential
 is stored locally and is only sent as an HTTP Bearer credential to mint relay
 tickets. The settings drawer groups automation by user goal: wait for something
 on a page, teach a repeatable task, or diagnose a page. Its live state is

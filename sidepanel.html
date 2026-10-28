@@ -870,9 +870,10 @@
             <div class="setting-hint" id="settingsStatusDetail"></div>
           </div>
           <div class="setting-row">
-            <label for="relayBaseInput">Discovered desktop endpoint</label>
-            <input id="relayBaseInput" type="text" placeholder="Waiting for EvoFlux Desktop…" spellcheck="false" autocomplete="off" readonly>
-            <div class="setting-actions"><button class="btn" id="toggleConnectionBtn">Reconnect</button></div>
+            <label for="relayBaseInput">EvoFlux endpoint</label>
+            <input id="relayBaseInput" type="text" placeholder="http://127.0.0.1:PORT" spellcheck="false" autocomplete="off">
+            <div class="setting-hint" id="relayBaseHint">Automatic discovery is active. Enter an address to choose a running EvoFlux instance.</div>
+            <div class="setting-actions"><button class="btn primary" id="saveRelayBaseBtn">Save &amp; reconnect</button><button class="btn" id="resetRelayBaseBtn">Use automatic</button><button class="btn" id="toggleConnectionBtn">Reconnect</button></div>
           </div>
         </div>
       </section>

@@ -86,6 +86,9 @@ const activity = document.getElementById("activity");
 const activityLabel = document.getElementById("activityLabel");
 const activityDetail = document.getElementById("activityDetail");
 const relayBaseInput = document.getElementById("relayBaseInput");
+const relayBaseHint = document.getElementById("relayBaseHint");
+const saveRelayBaseBtn = document.getElementById("saveRelayBaseBtn");
+const resetRelayBaseBtn = document.getElementById("resetRelayBaseBtn");
 const toggleConnectionBtn = document.getElementById("toggleConnectionBtn");
 const settingsStatusDot = document.getElementById("settingsStatusDot");
 const settingsStatusText = document.getElementById("settingsStatusText");
@@ -663,7 +666,7 @@ function setControlsDisabled(disabled) {
   composer.disabled = disabled;
   sendBtn.disabled = disabled;
   stopBtn.disabled = disabled;
-  modelTrigger.disabled = disabled || !selectedSessionId;
+  modelTrigger.disabled = disabled || !activeTab?.id;
   attachPageBtn.disabled = disabled;
   attachSelectionBtn.disabled = disabled;
   captureRegionBtn.disabled = disabled;
@@ -1111,7 +1114,7 @@ function renderModelTrigger(session = null) {
   modelTrigger.title = currentSessionModel
     ? `${currentSessionModel} · ${thinkingLabel(currentSessionThinkingLevel)} thinking`
     : "Use the lead agent's default model";
-  modelTrigger.disabled = !selectedSessionId;
+  modelTrigger.disabled = !activeTab?.id;
   renderThinkingOptions();
   renderSpeedControl();
 }
@@ -1252,7 +1255,14 @@ async function loadBrowserModels({ force = false } = {}) {
 }
 
 async function openModelPicker() {
-  if (!selectedSessionId) return;
+  const tabId = activeTab?.id;
+  const scope = browserTabScope(activeTab);
+  if (!tabId) return;
+  if (!selectedSessionId) {
+    // Choosing a model is an explicit chat action, even before the first send.
+    await refreshPanel({ preserveTranscript: true, createIfMissing: true });
+    if (!selectedSessionId || activeTab?.id !== tabId || browserTabScope(activeTab) !== scope) return;
+  }
   const open = !modelPopover.classList.contains("visible");
   if (!open) {
     closeModelPicker();
@@ -1311,7 +1321,7 @@ async function persistSessionModelSettings(model, thinkingLevel) {
     setComposerStatus(error.message || String(error), "error");
   } finally {
     setModelSettingsBusy(false);
-    modelTrigger.disabled = !selectedSessionId;
+    modelTrigger.disabled = !activeTab?.id;
   }
 }
 
@@ -2055,7 +2065,7 @@ async function submitQuestion(request, inputs, button) {
 }
 
 async function resolvePanelSession(tab, { createIfMissing = false } = {}) {
-  // Lazy: refreshes resolve existing bindings; only the first send provisions.
+  // Refreshes stay lazy; sending or choosing a model can provision the session.
   const response = await chrome.runtime.sendMessage({
     type: "ensure_browser_session_for_tab",
     create_if_missing: createIfMissing,
@@ -2065,7 +2075,7 @@ async function resolvePanelSession(tab, { createIfMissing = false } = {}) {
   return response;
 }
 
-async function refreshPanel({ preserveTranscript = false } = {}) {
+async function refreshPanel({ preserveTranscript = false, createIfMissing = false } = {}) {
   const generation = ++refreshGeneration;
   setConnectionState("connecting");
   setControlsDisabled(true);
@@ -2081,7 +2091,7 @@ async function refreshPanel({ preserveTranscript = false } = {}) {
     activeTab = nextTab;
     await loadPendingBrowserDialog();
     pageTitle.textContent = activeTab.title || safePageUrl(activeTab.url || activeTab.pendingUrl || "") || "Side Chat";
-    const ensured = await resolvePanelSession(activeTab);
+    const ensured = await resolvePanelSession(activeTab, { createIfMissing });
     if (generation !== refreshGeneration) return;
     const previousSessionId = selectedSessionId;
     selectedSessionId = ensured.session_id || "";
@@ -3414,10 +3424,13 @@ function closeSettings() {
 async function refreshSettings() {
   try {
     const [config, response] = await Promise.all([
-      chrome.storage.local.get(["relayBase"]),
+      chrome.storage.local.get(["relayBase", "relayBaseOverride"]),
       chrome.runtime.sendMessage({ type: "get_status" }),
     ]);
-    if (document.activeElement !== relayBaseInput) relayBaseInput.value = config.relayBase || DEFAULT_RELAY_BASE;
+    if (document.activeElement !== relayBaseInput) relayBaseInput.value = config.relayBaseOverride || config.relayBase || "";
+    relayBaseHint.textContent = config.relayBaseOverride
+      ? "Using your saved endpoint. Automatic discovery will not replace it."
+      : "Automatic discovery is active. Enter an address to choose a running EvoFlux instance.";
     const connected = Boolean(response?.connected);
     const connecting = Boolean(response?.connecting);
     const nativeConnection = response?.connection_mode === "native";
@@ -3427,11 +3440,11 @@ async function refreshSettings() {
     settingsStatusDot.className = `status-dot ${connected ? "live" : connecting ? "" : "error"}`.trim();
     settingsStatusText.textContent = connected ? "Connected" : connecting ? "Connecting…" : "Disconnected";
     settingsStatusDetail.textContent = connected
-      ? nativeConnection
+      ? nativeConnection && !config.relayBaseOverride
         ? `Connected automatically to EvoFlux Desktop (${response.relay_base || DEFAULT_RELAY_BASE})`
         : `Connected to ${response.relay_base || DEFAULT_RELAY_BASE}`
       : connecting
-        ? nativeConnection
+        ? nativeConnection && !config.relayBaseOverride
           ? "Discovering EvoFlux Desktop automatically…"
           : `Connecting to ${response.relay_base || DEFAULT_RELAY_BASE}`
         : nativeError
@@ -3559,6 +3572,34 @@ async function stopAllWatches() {
 async function toggleConnection() {
   await chrome.runtime.sendMessage({ type: "toggle_connection" });
   setTimeout(() => void refreshSettings(), 500);
+}
+
+async function saveRelayEndpoint({ automatic = false } = {}) {
+  saveRelayBaseBtn.disabled = true;
+  resetRelayBaseBtn.disabled = true;
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "set_relay_endpoint", endpoint: automatic ? "" : relayBaseInput.value.trim(),
+    });
+    if (!response?.ok) throw new Error(response?.error || "Could not save the EvoFlux endpoint.");
+    // Session and appearance state belong to the previous EvoFlux instance.
+    stopStream();
+    selectedSessionId = "";
+    currentSessionModel = null;
+    currentSessionThinkingLevel = null;
+    browserModels = [];
+    modelCatalogLoaded = false;
+    closeModelPicker();
+    clearTranscript();
+    renderModelTrigger();
+    await refreshSettings();
+    await refreshPanel();
+  } catch (error) {
+    relayBaseHint.textContent = error.message || String(error);
+  } finally {
+    saveRelayBaseBtn.disabled = false;
+    resetRelayBaseBtn.disabled = false;
+  }
 }
 
 async function runWatchAction() {
@@ -3710,6 +3751,11 @@ desktopGateBtn.addEventListener("click", () => void openInEvoFlux());
 closeSettingsBtn.addEventListener("click", closeSettings);
 settingsBackdrop.addEventListener("click", closeSettings);
 toggleConnectionBtn.addEventListener("click", () => void toggleConnection());
+saveRelayBaseBtn.addEventListener("click", () => void saveRelayEndpoint());
+resetRelayBaseBtn.addEventListener("click", () => void saveRelayEndpoint({ automatic: true }));
+relayBaseInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") { event.preventDefault(); void saveRelayEndpoint(); }
+});
 themeControl.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-theme-value]");
   if (button) void setTheme(button.dataset.themeValue);
@@ -3883,8 +3929,13 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === "connection_state") {
     const isConnected = Boolean(message.connected);
     const isConnecting = Boolean(message.connecting);
+    const wasConnected = panelConnectionStatus === "connected";
     setConnectionState(isConnected ? "connected" : isConnecting ? "connecting" : "offline");
     if (isConnected) void syncDesktopAppearance();
+    // An initial refresh can fail before the active tab and session are loaded.
+    if (isConnected && !wasConnected && !selectedSessionId) {
+      void refreshPanel({ preserveTranscript: true });
+    }
     if (settingsDrawer.classList.contains("visible")) void refreshSettings();
     return;
   }

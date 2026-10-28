@@ -63,6 +63,9 @@ let attachedTabs = new Map(); // tabId → true (CDP attached)
 let manualDisconnect = false;
 let lastCloseReason = null; // null | "ticket" (4401) | "pairing" (4403) | "closed"
 let relayBase = DEFAULT_RELAY_BASE;
+let relayBaseOverride = "";
+let connectionConfigGeneration = 0;
+let endpointUpdateInFlight = null;
 let pairingCredential = "";
 let pairingId = "";
 let pairingRelayBase = "";
@@ -177,12 +180,15 @@ const COMMAND_FEATURES = [
 // ── Config (persisted in chrome.storage.local, edited in Side Chat settings) ─
 
 async function loadConfig() {
+  if (endpointUpdateInFlight) await endpointUpdateInFlight;
   try {
     const cfg = await chrome.storage.local.get([
       "relayBase", "extensionId", "pairingCredential", "pairingId",
-      "pairingRelayBase", "pairingTransport",
+      "pairingRelayBase", "pairingTransport", "relayBaseOverride",
     ]);
     relayBase = (cfg.relayBase || DEFAULT_RELAY_BASE).trim().replace(/\/+$/, "");
+    relayBaseOverride = normalizeRelayOverride(cfg.relayBaseOverride || "");
+    if (relayBaseOverride) relayBase = relayBaseOverride;
     pairingCredential = (cfg.pairingCredential || "").trim();
     pairingId = (cfg.pairingId || "").trim();
     pairingRelayBase = (cfg.pairingRelayBase || "").trim().replace(/\/+$/, "");
@@ -203,13 +209,28 @@ async function loadConfig() {
   }
 }
 
+function normalizeRelayOverride(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  let url;
+  try { url = new URL(text); } catch { throw new Error("Enter a local EvoFlux URL with an explicit port."); }
+  if (!["http:", "ws:"].includes(url.protocol) ||
+      !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname.toLowerCase()) ||
+      !url.port || url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
+    throw new Error("Use http://127.0.0.1:PORT or ws://localhost:PORT without a path, credentials, query, or fragment.");
+  }
+  return `ws://${url.host}`;
+}
+
 function requestNativeDiscovery() {
   return new Promise((resolve, reject) => {
     if (typeof chrome.runtime.sendNativeMessage !== "function") {
       reject(new Error("Native Messaging is unavailable"));
       return;
     }
-    chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, { type: "discover" }, (response) => {
+    chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, {
+      type: "discover", ...(relayBaseOverride ? { base_url: relayBaseOverride.replace(/^ws:/, "http:") } : {}),
+    }, (response) => {
       const runtimeError = chrome.runtime.lastError;
       if (runtimeError) {
         reject(new Error(runtimeError.message || "Native Messaging failed"));
@@ -231,14 +252,38 @@ function failNativeDiscovery(message) {
   throw error;
 }
 
+function sameRelayEndpoint(left, right) {
+  try {
+    const a = new URL(canonicalRelayBase(left));
+    const b = new URL(canonicalRelayBase(right));
+    const host = (url) => url.hostname === "localhost" ? "127.0.0.1" : url.hostname;
+    return a.protocol === b.protocol && host(a) === host(b) && a.port === b.port;
+  } catch { return false; }
+}
+
 async function discoverNativeConnection() {
+  const generation = connectionConfigGeneration;
+  const override = relayBaseOverride;
   let response;
   try {
     response = await requestNativeDiscovery();
   } catch (error) {
-    nativeDiscoveryError = error?.message || String(error);
-    error.code = "native_discovery";
-    throw error;
+    if (override) response = null;
+    else {
+      nativeDiscoveryError = error?.message || String(error);
+      error.code = "native_discovery";
+      throw error;
+    }
+  }
+  if (override && (!response?.base_url || !sameRelayEndpoint(response.base_url, override))) {
+    const discovery = await fetch(buildHttpUrl("/api/team/webbridge/native-discovery", override), {
+      redirect: "error", signal: AbortSignal.timeout(5000),
+    });
+    if (!discovery.ok) {
+      failNativeDiscovery("The selected EvoFlux endpoint could not authorize WebBridge. Update and start that Desktop instance so it publishes its own Native Messaging discovery record.");
+    }
+    const body = await discovery.json();
+    response = { protocol_version: 1, app_pid: 1, base_url: override.replace(/^ws:/, "http:"), discovery_token: body.discovery_token };
   }
   if (response.protocol_version !== 1 || !Number.isInteger(response.app_pid) || response.app_pid <= 0) {
     failNativeDiscovery("EvoFlux Desktop returned an incompatible discovery response");
@@ -249,7 +294,7 @@ async function discoverNativeConnection() {
   } catch {
     failNativeDiscovery("EvoFlux Desktop returned an invalid connection address");
   }
-  const loopback = ["localhost", "127.0.0.1", "::1"].includes(parsed.hostname.toLowerCase());
+  const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname.toLowerCase());
   if (parsed.protocol !== "http:" || !loopback || !parsed.port) {
     failNativeDiscovery("EvoFlux Desktop must expose an explicit loopback HTTP port");
   }
@@ -258,14 +303,15 @@ async function discoverNativeConnection() {
     failNativeDiscovery("EvoFlux Desktop returned an invalid discovery token");
   }
 
-  relayBase = response.base_url.trim().replace(/\/+$/, "").replace(/^http:/i, "ws:");
+  if (generation !== connectionConfigGeneration) throw new Error("Connection settings changed; retrying.");
+  relayBase = override || response.base_url.trim().replace(/\/+$/, "").replace(/^http:/i, "ws:");
   nativeDiscoveryToken = discoveryToken;
   connectionMode = "native";
   nativeDiscoveryError = "";
   const updates = { relayBase };
   // Native pairings are scoped to the desktop install, not its ephemeral
   // sidecar port. Carry a valid credential forward when the app restarts.
-  if (pairingCredential && pairingTransport === "native") {
+  if (!override && pairingCredential && pairingTransport === "native") {
     pairingRelayBase = canonicalRelayBase();
     updates.pairingRelayBase = pairingRelayBase;
   }
@@ -281,7 +327,7 @@ function canonicalRelayBase(value = relayBase) {
 }
 
 async function refreshNativeConnectionIfChanged() {
-  if (manualDisconnect || connectionMode !== "native") return false;
+  if (manualDisconnect || relayBaseOverride || connectionMode !== "native") return false;
   if (nativeRefreshInFlight) return nativeRefreshInFlight;
 
   const previousRelayBase = canonicalRelayBase();
@@ -332,7 +378,7 @@ function assertRelayTransportSecure() {
     throw error;
   }
   const host = parsed.hostname.toLowerCase();
-  const loopback = host === "localhost" || host === "127.0.0.1" || host === "::1";
+  const loopback = host === "localhost" || host === "127.0.0.1" || host === "[::1]";
   if (parsed.protocol === "ws:" && !loopback) {
     const error = new Error("Remote WebBridge relays require HTTPS/WSS");
     error.code = "relay_security";
@@ -1436,6 +1482,7 @@ async function persistConnectionCredential(
 }
 
 async function bootstrapNativeConnection() {
+  const generation = connectionConfigGeneration;
   await loadConfig();
   assertRelayTransportSecure();
   if (connectionMode !== "native" || !nativeDiscoveryToken) {
@@ -1445,7 +1492,7 @@ async function bootstrapNativeConnection() {
   }
   const bootstrapRelayBase = canonicalRelayBase();
   const parsed = new URL(bootstrapRelayBase);
-  if (!["localhost", "127.0.0.1", "::1"].includes(parsed.hostname.toLowerCase())) {
+  if (!["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname.toLowerCase())) {
     throw new Error("The connection address must point to EvoFlux on this device.");
   }
   const response = await fetch(buildHttpUrl(NATIVE_PAIRING_PATH, bootstrapRelayBase), {
@@ -1462,6 +1509,7 @@ async function bootstrapNativeConnection() {
     throw new Error(await responseError(response, "Connection was rejected"));
   }
   const body = await response.json();
+  if (generation !== connectionConfigGeneration) throw new Error("Connection settings changed; retrying.");
   await persistConnectionCredential(body, bootstrapRelayBase, "native");
   return { pairing_id: pairingId, scopes: body.scopes || [] };
 }
@@ -6734,6 +6782,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       connect();
     }
     sendResponse({ ok: true });
+    return true;
+  }
+
+  if (msg.type === "set_relay_endpoint") {
+    (async () => {
+      try {
+        const override = normalizeRelayOverride(msg.endpoint);
+        if (endpointUpdateInFlight) await endpointUpdateInFlight;
+        const update = (async () => {
+          connectionConfigGeneration++;
+          disconnect();
+          await clearRevokedPairingState();
+          relayBaseOverride = override;
+          nativeDiscoveryToken = "";
+          nativeDiscoveryError = "";
+          await chrome.storage.local.set({ relayBaseOverride: override, ...(override ? { relayBase: override } : {}) });
+        })();
+        endpointUpdateInFlight = update;
+        try { await update; } finally {
+          if (endpointUpdateInFlight === update) endpointUpdateInFlight = null;
+        }
+        manualDisconnect = false;
+        reconnectAttempts = 0;
+        void connect();
+        sendResponse({ ok: true });
+      } catch (error) { sendResponse({ ok: false, error: error.message }); }
+    })();
     return true;
   }
 
